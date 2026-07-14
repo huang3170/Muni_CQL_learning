@@ -1,0 +1,24 @@
+{
+  "state_cols": [
+    "coupon",
+    "duration",
+    "rating_numeric",
+    "amount_outstanding_log",
+    "cep_price",
+    "cep_bid_ask_width",
+    "days_since_last_trade",
+    "trade_count_30d_log",
+    "trade_volume_30d_log",
+    "realized_volatility_30d",
+    "inventory_fraction_remaining",
+    "position_age_days",
+    "time_to_close_fraction",
+    "time_to_deadline_fraction",
+    "forward_price_change_4h",
+    "forward_price_up_probability",
+    "forward_price_down_probability",
+    "forward_model_confidence",
+    "previous_price_offset",
+    "previous_quantity_fraction"
+  ]
+}

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# Generated datasets and model artifacts
+demo_data/
+demo_output/
+transitions/
+checkpoints/
+*.npy
+*.npz
+*.pt
+*.pth
+*.parquet
