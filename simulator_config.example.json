@@ -5,6 +5,28 @@
     "trigger_on_same_cusip_publish": true,
     "min_quote_life_minutes": 0
   },
+  "price_action": {
+    "price_offset_ratios": [
+      -1.0,
+      -0.5,
+      -0.25,
+      0.0,
+      0.25,
+      0.5,
+      1.0
+    ],
+    "spread_feature_names": [
+      "cep_bid_ask_width",
+      "predicted_bid_ask_spread",
+      "segment_bid_ask_spread"
+    ],
+    "spread_floor": 0.02,
+    "spread_cap": 4.0,
+    "fallback_spread": 0.5,
+    "spread_unit_multiplier": 0.5,
+    "max_absolute_price_offset": 2.0,
+    "mask_if_offset_clipped": true
+  },
   "fill_simulator": {
     "mode": "partial",
     "allowed_trade_types": [
@@ -19,6 +41,7 @@
     "inventory_lambda": 0.05,
     "schedule_lambda": 0.1,
     "price_smooth_lambda": 0.01,
+    "price_dollar_smooth_lambda": 0.0,
     "quantity_smooth_lambda": 0.01,
     "update_cost": 0.001,
     "underpricing_lambda": 0,

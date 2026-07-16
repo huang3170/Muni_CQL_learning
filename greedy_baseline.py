@@ -206,21 +206,22 @@ class ForecastAwareGreedyPolicy:
             if env.previous_action_id is not None
             else ActionSpec(-1, 0.0, 0.0, True)
         )
-        price_scale = max(
-            float(
-                env.current_snapshot.features.get(
-                    reward_cfg.price_scale_feature_name,
-                    1.0,
-                )
-            ),
-            1.0e-6,
-        )
         smoothness_penalty = 0.0
         if self.config.include_smoothness_penalty and env.previous_action_id is not None:
+            previous_dollar = (
+                env.active_quote.price_offset_dollar if env.active_quote is not None else 0.0
+            )
+            current_dollar = float(preview["price_offset_dollar"])
+            spread_scale = max(float(preview["effective_spread"]), 1.0e-6)
             smoothness_penalty = (
                 reward_cfg.price_smooth_lambda
-                * abs(float(spec.price_offset or 0.0) - float(previous_spec.price_offset or 0.0))
-                / price_scale
+                * abs(
+                    float(spec.price_offset_ratio or 0.0)
+                    - float(previous_spec.price_offset_ratio or 0.0)
+                )
+                + reward_cfg.price_dollar_smooth_lambda
+                * abs(current_dollar - previous_dollar)
+                / spread_scale
                 + reward_cfg.quantity_smooth_lambda
                 * abs(float(spec.quantity_fraction) - float(previous_spec.quantity_fraction))
             )
@@ -254,7 +255,12 @@ class ForecastAwareGreedyPolicy:
             "expected_remaining_inventory": float(remaining),
             "offer_price": offer_price,
             "offer_quantity": float(preview["offer_quantity"]),
-            "price_offset": float(preview["price_offset"]),
+            "price_offset_ratio": float(preview["price_offset_ratio"]),
+            "price_offset_dollar": float(preview["price_offset_dollar"]),
+            "raw_price_offset_dollar": float(preview["raw_price_offset_dollar"]),
+            "effective_spread": float(preview["effective_spread"]),
+            "spread_unit": float(preview["spread_unit"]),
+            "offset_was_clipped": float(preview["offset_was_clipped"]),
             "quantity_fraction": float(preview["quantity_fraction"]),
             "pretrade_win_probability": float(preview["win_probability"]),
             "pretrade_participation_share": float(preview["participation_share"]),
@@ -270,14 +276,17 @@ class ForecastAwareGreedyPolicy:
         if env.previous_action_id is not None:
             previous = self.action_grid.decode(env.previous_action_id)
             change = (
-                abs(float(spec.price_offset or 0.0) - float(previous.price_offset or 0.0))
+                abs(
+                    float(spec.price_offset_ratio or 0.0)
+                    - float(previous.price_offset_ratio or 0.0)
+                )
                 + abs(float(spec.quantity_fraction) - float(previous.quantity_fraction))
             )
         else:
             change = 0.0
         return (
             float(change),
-            abs(float(spec.price_offset or 0.0)),
+            abs(float(spec.price_offset_ratio or 0.0)),
             float(spec.quantity_fraction),
             int(action_id),
         )

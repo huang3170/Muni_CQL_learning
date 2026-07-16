@@ -395,6 +395,12 @@ def load_warmstart(
         raise ValueError(
             f"warm-start num_actions={checkpoint['num_actions']} but simulator num_actions={num_actions}"
         )
+    grid_payload = checkpoint.get("action_grid", {})
+    if "price_offsets" in grid_payload and "price_offset_ratios" not in grid_payload:
+        raise ValueError(
+            "Warm-start checkpoint uses legacy absolute-dollar action semantics. "
+            "Rebuild offline transitions and retrain the warm start with v4 spread-relative ratios."
+        )
     trainer = CQLDuelingDoubleDQNTrainer(state_dim, num_actions, config, device)
     trainer.online.load_state_dict(checkpoint["model_state_dict"])
     trainer.target.load_state_dict(checkpoint.get("target_state_dict", checkpoint["model_state_dict"]))
@@ -460,6 +466,14 @@ def run_training(args: argparse.Namespace) -> None:
         trigger_on_same_cusip_publish=not args.no_trade_publish_trigger,
         trigger_on_own_fill=not args.no_own_fill_trigger,
         min_quote_life_minutes=args.min_quote_life_minutes,
+        spread_feature_names=tuple(args.spread_feature_names),
+        spread_age_feature_name=args.spread_age_feature_name,
+        spread_floor=args.spread_floor,
+        spread_cap=args.spread_cap,
+        fallback_spread=args.fallback_spread,
+        spread_unit_multiplier=args.spread_unit_multiplier,
+        max_absolute_price_offset=args.max_absolute_price_offset,
+        mask_if_offset_clipped=not args.allow_clipped_offset_actions,
         min_price_delta_from_mark=args.min_price_delta_from_mark,
         max_price_delta_from_mark=args.max_price_delta_from_mark,
         support_threshold=args.support_threshold,
@@ -469,6 +483,7 @@ def run_training(args: argparse.Namespace) -> None:
         inventory_lambda=args.inventory_lambda,
         schedule_lambda=args.schedule_lambda,
         price_smooth_lambda=args.price_smooth_lambda,
+        price_dollar_smooth_lambda=args.price_dollar_smooth_lambda,
         quantity_smooth_lambda=args.quantity_smooth_lambda,
         update_cost=args.update_cost,
         missed_demand_lambda=args.missed_demand_lambda,
@@ -931,6 +946,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-trade-publish-trigger", action="store_true")
     parser.add_argument("--no-own-fill-trigger", action="store_true")
     parser.add_argument("--min-quote-life-minutes", type=float, default=0.0)
+    parser.add_argument(
+        "--spread-feature-names",
+        nargs="+",
+        default=["cep_bid_ask_width", "predicted_bid_ask_spread", "segment_bid_ask_spread"],
+        help="Ordered point-in-time spread features; the first positive finite value is used.",
+    )
+    parser.add_argument("--spread-age-feature-name", default="spread_age_minutes")
+    parser.add_argument("--spread-floor", type=float, default=0.02)
+    parser.add_argument("--spread-cap", type=float, default=4.0)
+    parser.add_argument("--fallback-spread", type=float, default=0.50)
+    parser.add_argument(
+        "--spread-unit-multiplier",
+        type=float,
+        default=0.50,
+        help="0.5 means price_offset_ratio is measured in effective half-spreads.",
+    )
+    parser.add_argument("--max-absolute-price-offset", type=float, default=2.0)
+    parser.add_argument(
+        "--allow-clipped-offset-actions",
+        action="store_true",
+        help="Keep actions whose raw spread-relative dollar offset hits the absolute cap.",
+    )
     parser.add_argument("--min-price-delta-from-mark", type=float, default=-2.0)
     parser.add_argument("--max-price-delta-from-mark", type=float, default=2.0)
     parser.add_argument("--support-threshold", type=float, default=0.0)
@@ -938,7 +975,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--inventory-lambda", type=float, default=0.05)
     parser.add_argument("--schedule-lambda", type=float, default=0.10)
-    parser.add_argument("--price-smooth-lambda", type=float, default=0.01)
+    parser.add_argument(
+        "--price-smooth-lambda",
+        type=float,
+        default=0.01,
+        help="Penalty on changes in the spread-relative price-offset ratio.",
+    )
+    parser.add_argument(
+        "--price-dollar-smooth-lambda",
+        type=float,
+        default=0.0,
+        help="Optional penalty on dollar offset changes normalized by effective spread.",
+    )
     parser.add_argument("--quantity-smooth-lambda", type=float, default=0.01)
     parser.add_argument("--update-cost", type=float, default=0.001)
     parser.add_argument("--missed-demand-lambda", type=float, default=0.0)

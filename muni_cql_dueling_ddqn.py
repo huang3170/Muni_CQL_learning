@@ -2,7 +2,7 @@
 """First-version offline CQL-regularized Dueling Double DQN trainer.
 
 Designed for a municipal-bond offer-pricing policy with a discrete action grid:
-    action = (price_offset, inventory_fraction), plus one no-quote action.
+    action = (price_offset_ratio, inventory_fraction), plus one no-quote action.
 
 The trainer consumes offline transitions from either an NPZ file or a directory of memory-mapped NPY arrays. It does not fabricate
 counterfactual rewards; each training row must represent a logged or explicitly
@@ -88,40 +88,57 @@ def resolve_device(requested: str) -> torch.device:
 @dataclass(frozen=True)
 class ActionSpec:
     action_id: int
-    price_offset: Optional[float]
+    price_offset_ratio: Optional[float]
     quantity_fraction: float
     is_no_quote: bool = False
+
+    @property
+    def price_offset(self) -> Optional[float]:
+        """Backward-compatible alias. Values are now half-spread ratios, not dollars."""
+        return self.price_offset_ratio
 
 
 @dataclass(frozen=True)
 class ActionGrid:
-    """Maps action IDs to price offsets and inventory fractions."""
+    """Maps action IDs to spread-relative price ratios and inventory fractions.
 
-    price_offsets: Tuple[float, ...] = (-0.50, -0.25, -0.125, 0.0, 0.125, 0.25, 0.50)
+    The actual dollar price adjustment is materialized by the simulator as::
+
+        dollar_offset = price_offset_ratio * spread_unit
+
+    where ``spread_unit`` defaults to one half of the effective bid-ask spread.
+    """
+
+    price_offset_ratios: Tuple[float, ...] = (-1.0, -0.50, -0.25, 0.0, 0.25, 0.50, 1.0)
     quantity_fractions: Tuple[float, ...] = (0.10, 0.25, 0.50, 0.75, 1.00)
     include_no_quote: bool = True
 
     @property
+    def price_offsets(self) -> Tuple[float, ...]:
+        """Backward-compatible alias for legacy callers/checkpoints."""
+        return self.price_offset_ratios
+
+    @property
     def num_actions(self) -> int:
-        return len(self.price_offsets) * len(self.quantity_fractions) + int(self.include_no_quote)
+        return len(self.price_offset_ratios) * len(self.quantity_fractions) + int(self.include_no_quote)
 
     def decode(self, action_id: int) -> ActionSpec:
         if action_id < 0 or action_id >= self.num_actions:
             raise ValueError(f"action_id={action_id} outside [0, {self.num_actions})")
-        grid_size = len(self.price_offsets) * len(self.quantity_fractions)
+        grid_size = len(self.price_offset_ratios) * len(self.quantity_fractions)
         if self.include_no_quote and action_id == grid_size:
             return ActionSpec(action_id, None, 0.0, True)
         price_index = action_id // len(self.quantity_fractions)
         quantity_index = action_id % len(self.quantity_fractions)
         return ActionSpec(
             action_id=action_id,
-            price_offset=self.price_offsets[price_index],
+            price_offset_ratio=self.price_offset_ratios[price_index],
             quantity_fraction=self.quantity_fractions[quantity_index],
             is_no_quote=False,
         )
 
     def encode(self, price_offset_index: int, quantity_fraction_index: int) -> int:
-        if not (0 <= price_offset_index < len(self.price_offsets)):
+        if not (0 <= price_offset_index < len(self.price_offset_ratios)):
             raise ValueError("Invalid price_offset_index")
         if not (0 <= quantity_fraction_index < len(self.quantity_fractions)):
             raise ValueError("Invalid quantity_fraction_index")
@@ -130,11 +147,12 @@ class ActionGrid:
     def no_quote_action_id(self) -> Optional[int]:
         if not self.include_no_quote:
             return None
-        return len(self.price_offsets) * len(self.quantity_fractions)
+        return len(self.price_offset_ratios) * len(self.quantity_fractions)
 
     def to_json_dict(self) -> Dict[str, Any]:
         return {
-            "price_offsets": list(self.price_offsets),
+            "price_offset_ratios": list(self.price_offset_ratios),
+            "offset_unit": "effective_half_spread",
             "quantity_fractions": list(self.quantity_fractions),
             "include_no_quote": self.include_no_quote,
             "num_actions": self.num_actions,
@@ -930,8 +948,14 @@ def run_inference(args: argparse.Namespace) -> None:
     action_id, q_values = trainer.select_action(normalized, mask)
 
     grid_payload = checkpoint.get("action_grid", {})
+    if "price_offsets" in grid_payload and "price_offset_ratios" not in grid_payload:
+        raise ValueError(
+            "Checkpoint uses legacy absolute-dollar price_offsets. "
+            "Use a v4 checkpoint trained with spread-relative action semantics."
+        )
+    ratio_values = grid_payload.get("price_offset_ratios", ActionGrid().price_offset_ratios)
     grid = ActionGrid(
-        price_offsets=tuple(grid_payload.get("price_offsets", ActionGrid().price_offsets)),
+        price_offset_ratios=tuple(ratio_values),
         quantity_fractions=tuple(grid_payload.get("quantity_fractions", ActionGrid().quantity_fractions)),
         include_no_quote=bool(grid_payload.get("include_no_quote", True)),
     )
@@ -975,18 +999,19 @@ def make_demo_dataset(path: Path, n: int, state_dim: int, action_grid: ActionGri
         if not masks[i, behavior_action[i]]:
             behavior_action[i] = int(np.flatnonzero(masks[i])[0])
 
-    price_offsets = np.array(
-        [action_grid.decode(i).price_offset or 0.0 for i in range(num_actions)], dtype=np.float32
+    price_offset_ratios = np.array(
+        [action_grid.decode(i).price_offset_ratio or 0.0 for i in range(num_actions)],
+        dtype=np.float32,
     )
     qty_fractions = np.array(
         [action_grid.decode(i).quantity_fraction for i in range(num_actions)], dtype=np.float32
     )
-    chosen_offset = price_offsets[behavior_action]
+    chosen_offset_ratio = price_offset_ratios[behavior_action]
     chosen_qty = qty_fractions[behavior_action]
     rewards = (
         0.3 * latent
         + 1.2 * chosen_qty
-        - 1.8 * chosen_offset**2
+        - 1.8 * chosen_offset_ratio**2
         - 0.7 * (chosen_qty - 0.5 - 0.1 * np.tanh(latent)) ** 2
         + rng.normal(scale=0.2, size=n)
     ).astype(np.float32)

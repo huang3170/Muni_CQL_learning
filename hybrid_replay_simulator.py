@@ -59,6 +59,22 @@ class SimulatorConfig:
     min_quote_life_minutes: float = 0.0
     clock_overrides_min_quote_life: bool = True
     own_fill_overrides_min_quote_life: bool = True
+
+    # Spread-relative price action mapping. The default action unit is one
+    # half of the effective full bid-ask spread.
+    spread_feature_names: Tuple[str, ...] = (
+        "cep_bid_ask_width",
+        "predicted_bid_ask_spread",
+        "segment_bid_ask_spread",
+    )
+    spread_age_feature_name: str = "spread_age_minutes"
+    spread_floor: float = 0.02
+    spread_cap: float = 4.0
+    fallback_spread: float = 0.50
+    spread_unit_multiplier: float = 0.50
+    max_absolute_price_offset: float = 2.0
+    mask_if_offset_clipped: bool = True
+
     min_price_delta_from_mark: float = -2.0
     max_price_delta_from_mark: float = 2.0
     support_threshold: float = 0.0
@@ -79,13 +95,24 @@ class SimulatorConfig:
             raise ValueError(
                 "quantity_model_definition must be participation_share or displayed_quote_ratio"
             )
+        if not self.spread_feature_names:
+            raise ValueError("spread_feature_names must contain at least one feature")
+        if self.spread_floor <= 0 or self.spread_cap < self.spread_floor:
+            raise ValueError("spread_floor must be positive and spread_cap >= spread_floor")
+        if self.fallback_spread <= 0:
+            raise ValueError("fallback_spread must be positive")
+        if self.spread_unit_multiplier <= 0:
+            raise ValueError("spread_unit_multiplier must be positive")
+        if self.max_absolute_price_offset <= 0:
+            raise ValueError("max_absolute_price_offset must be positive")
 
 
 @dataclass(frozen=True)
 class RewardConfig:
     inventory_lambda: float = 0.05
     schedule_lambda: float = 0.10
-    price_smooth_lambda: float = 0.01
+    price_smooth_lambda: float = 0.01  # applied to offset-ratio changes
+    price_dollar_smooth_lambda: float = 0.0  # optional spread-normalized dollar change
     quantity_smooth_lambda: float = 0.01
     update_cost: float = 0.001
     missed_demand_lambda: float = 0.0
@@ -330,6 +357,14 @@ class QuoteCandidate:
     action: ActionSpec
     offer_price: float
     offer_quantity: float
+    price_offset_ratio: float
+    price_offset_dollar: float
+    raw_price_offset_dollar: float
+    effective_spread: float
+    spread_unit: float
+    spread_source_index: float
+    spread_is_fallback: float
+    offset_was_clipped: bool
 
 
 class SimulatorModelBundle(Protocol):
@@ -443,7 +478,10 @@ def load_model_bundle(factory_spec: Optional[str]) -> SimulatorModelBundle:
 @dataclass
 class ActiveQuote:
     action_id: int
-    price_offset: float
+    price_offset_ratio: float
+    price_offset_dollar: float
+    effective_spread: float
+    spread_unit: float
     quantity_fraction: float
     offer_price: float
     initial_quantity: float
@@ -487,7 +525,14 @@ class HybridMuniReplayEnv:
         "cumulative_fill_fraction",
         "live_quote_fraction_of_inventory",
         "quote_age_minutes",
-        "previous_price_offset",
+        "effective_spread",
+        "spread_unit",
+        "log_effective_spread",
+        "spread_age_minutes",
+        "spread_source_index",
+        "spread_is_fallback",
+        "previous_price_offset_ratio",
+        "previous_price_offset_dollar",
         "previous_quantity_fraction",
         "quote_update_count",
         "last_own_fill_fraction",
@@ -511,6 +556,10 @@ class HybridMuniReplayEnv:
     ACTION_GRID_FEATURE_NAMES: Tuple[str, ...] = (
         "anchor_minus_mark",
         "offer_minus_mark",
+        "price_offset_ratio",
+        "price_offset_dollar",
+        "effective_spread",
+        "spread_unit",
         "pretrade_win_probability",
         "pretrade_participation_share",
         "expected_fill_fraction",
@@ -705,12 +754,10 @@ class HybridMuniReplayEnv:
         )
 
     def preview_action(self, action_id: int, simulator_mode: Optional[str] = None) -> Dict[str, float]:
-        """Return point-in-time, pre-trade action diagnostics without mutating the environment.
+        """Return point-in-time, pre-trade action diagnostics without mutation.
 
-        The preview deliberately uses only information observable at the current
-        decision time.  It never inspects the next historical trade.  This makes
-        it suitable for deployable greedy/model-based baselines as well as policy
-        diagnostics.
+        Price actions are spread-relative. The returned diagnostics expose both
+        the dimensionless ratio and the materialized dollar offset.
         """
         mask = self.action_mask()
         if action_id < 0 or action_id >= self.action_grid.num_actions or not bool(mask[action_id]):
@@ -722,10 +769,18 @@ class HybridMuniReplayEnv:
         context = self._model_context()
         spec = self.action_grid.decode(action_id)
         if spec.is_no_quote:
+            spread = self._effective_spread_info(context, max(min(self.inventory, self.config.min_lot), 0.0))
             return {
                 "action_id": float(action_id),
                 "is_no_quote": 1.0,
-                "price_offset": 0.0,
+                "price_offset_ratio": 0.0,
+                "price_offset_dollar": 0.0,
+                "raw_price_offset_dollar": 0.0,
+                "effective_spread": spread["effective_spread"],
+                "spread_unit": spread["spread_unit"],
+                "spread_source_index": spread["spread_source_index"],
+                "spread_is_fallback": spread["spread_is_fallback"],
+                "offset_was_clipped": 0.0,
                 "quantity_fraction": 0.0,
                 "offer_price": math.nan,
                 "offer_quantity": 0.0,
@@ -753,7 +808,14 @@ class HybridMuniReplayEnv:
         return {
             "action_id": float(action_id),
             "is_no_quote": 0.0,
-            "price_offset": float(spec.price_offset or 0.0),
+            "price_offset_ratio": float(quote.price_offset_ratio),
+            "price_offset_dollar": float(quote.price_offset_dollar),
+            "raw_price_offset_dollar": float(quote.raw_price_offset_dollar),
+            "effective_spread": float(quote.effective_spread),
+            "spread_unit": float(quote.spread_unit),
+            "spread_source_index": float(quote.spread_source_index),
+            "spread_is_fallback": float(quote.spread_is_fallback),
+            "offset_was_clipped": float(quote.offset_was_clipped),
             "quantity_fraction": float(spec.quantity_fraction),
             "offer_price": float(quote.offer_price),
             "offer_quantity": float(quote.offer_quantity),
@@ -793,6 +855,10 @@ class HybridMuniReplayEnv:
             if self.previous_action_id is not None
             else ActionSpec(-1, 0.0, 0.0, True)
         )
+        spread = self._effective_spread_info(context, max(self.inventory, self.config.min_lot))
+        previous_dollar_offset = (
+            self.active_quote.price_offset_dollar if self.active_quote is not None else 0.0
+        )
         dynamic = (
             self.inventory,
             self.inventory / self.episode.starting_inventory,
@@ -806,7 +872,14 @@ class HybridMuniReplayEnv:
             self.cumulative_fill / self.episode.starting_inventory,
             live_fraction,
             quote_age,
-            float(previous_spec.price_offset or 0.0),
+            spread["effective_spread"],
+            spread["spread_unit"],
+            math.log(max(spread["effective_spread"], 1.0e-12)),
+            spread["spread_age_minutes"],
+            spread["spread_source_index"],
+            spread["spread_is_fallback"],
+            float(previous_spec.price_offset_ratio or 0.0),
+            float(previous_dollar_offset),
             float(previous_spec.quantity_fraction),
             float(self.quote_update_count),
             self.last_own_fill / self.episode.starting_inventory,
@@ -840,6 +913,10 @@ class HybridMuniReplayEnv:
                     (
                         anchor - context.fair_mark,
                         quote.offer_price - context.fair_mark,
+                        quote.price_offset_ratio,
+                        quote.price_offset_dollar,
+                        quote.effective_spread,
+                        quote.spread_unit,
                         p_win,
                         share,
                         expected_fill_fraction,
@@ -874,6 +951,7 @@ class HybridMuniReplayEnv:
                 quote.offer_quantity >= self.config.min_lot
                 and quote.offer_quantity <= self.inventory + 1e-9
                 and self.config.min_price_delta_from_mark <= price_delta <= self.config.max_price_delta_from_mark
+                and (not self.config.mask_if_offset_clipped or not quote.offset_was_clipped)
                 and self.models.support_score(context, quote) >= self.config.support_threshold
             )
             mask[action_id] = bool(valid)
@@ -975,14 +1053,20 @@ class HybridMuniReplayEnv:
             else ActionSpec(-1, 0.0, 0.0, True)
         )
         changed = self.previous_action_id is not None and action_id != self.previous_action_id
-        price_scale = max(
-            float(self.current_snapshot.features.get(self.reward_config.price_scale_feature_name, 1.0)),
-            1e-6,
+        candidate = None if spec.is_no_quote else self._candidate_from_spec(context, spec)
+        previous_dollar = self.active_quote.price_offset_dollar if self.active_quote is not None else 0.0
+        current_dollar = candidate.price_offset_dollar if candidate is not None else 0.0
+        current_spread = (
+            candidate.effective_spread
+            if candidate is not None
+            else (self.active_quote.effective_spread if self.active_quote is not None else 1.0)
         )
         smooth = 0.0 if self.previous_action_id is None else (
             self.reward_config.price_smooth_lambda
-            * abs(float(spec.price_offset or 0.0) - float(previous_spec.price_offset or 0.0))
-            / price_scale
+            * abs(float(spec.price_offset_ratio or 0.0) - float(previous_spec.price_offset_ratio or 0.0))
+            + self.reward_config.price_dollar_smooth_lambda
+            * abs(current_dollar - previous_dollar)
+            / max(current_spread, 1.0e-6)
             + self.reward_config.quantity_smooth_lambda
             * abs(float(spec.quantity_fraction) - float(previous_spec.quantity_fraction))
         )
@@ -993,10 +1077,13 @@ class HybridMuniReplayEnv:
         if spec.is_no_quote:
             self.active_quote = None
         else:
-            candidate = self._candidate_from_spec(context, spec)
+            assert candidate is not None
             self.active_quote = ActiveQuote(
                 action_id=action_id,
-                price_offset=float(spec.price_offset or 0.0),
+                price_offset_ratio=float(candidate.price_offset_ratio),
+                price_offset_dollar=float(candidate.price_offset_dollar),
+                effective_spread=float(candidate.effective_spread),
+                spread_unit=float(candidate.spread_unit),
                 quantity_fraction=float(spec.quantity_fraction),
                 offer_price=candidate.offer_price,
                 initial_quantity=candidate.offer_quantity,
@@ -1007,15 +1094,86 @@ class HybridMuniReplayEnv:
         self.quote_update_count += 1
         self.last_own_fill = 0.0
 
+    def _effective_spread_info(self, context: ModelContext, quantity: float) -> Dict[str, float]:
+        raw_spread: Optional[float] = None
+        source_index = -1.0
+        is_fallback = 0.0
+
+        model_method = getattr(self.models, "effective_spread", None)
+        if callable(model_method):
+            try:
+                candidate = float(model_method(context, quantity))
+            except (TypeError, ValueError):
+                candidate = math.nan
+            if math.isfinite(candidate) and candidate > 0:
+                raw_spread = candidate
+                source_index = -1.0
+
+        if raw_spread is None:
+            for index, feature_name in enumerate(self.config.spread_feature_names):
+                value = context.snapshot_features.get(feature_name)
+                if value is None:
+                    continue
+                candidate = float(value)
+                if math.isfinite(candidate) and candidate > 0:
+                    raw_spread = candidate
+                    source_index = float(index)
+                    break
+
+        if raw_spread is None:
+            raw_spread = self.config.fallback_spread
+            source_index = float(len(self.config.spread_feature_names))
+            is_fallback = 1.0
+
+        effective_spread = float(np.clip(raw_spread, self.config.spread_floor, self.config.spread_cap))
+        spread_unit = effective_spread * self.config.spread_unit_multiplier
+        age_value = context.snapshot_features.get(self.config.spread_age_feature_name, 0.0)
+        try:
+            spread_age_candidate = float(age_value)
+        except (TypeError, ValueError):
+            spread_age_candidate = 0.0
+        spread_age = spread_age_candidate if math.isfinite(spread_age_candidate) else 0.0
+        return {
+            "raw_spread": float(raw_spread),
+            "effective_spread": effective_spread,
+            "spread_unit": float(max(spread_unit, 1.0e-12)),
+            "spread_source_index": source_index,
+            "spread_is_fallback": is_fallback,
+            "spread_age_minutes": max(spread_age, 0.0),
+        }
+
     def _candidate_from_spec(self, context: ModelContext, spec: ActionSpec) -> QuoteCandidate:
         if spec.is_no_quote:
-            return QuoteCandidate(spec, math.nan, 0.0)
+            return QuoteCandidate(spec, math.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, False)
         quantity = _round_down_lot(
             min(context.inventory, spec.quantity_fraction * context.inventory), self.config.min_lot
         )
         anchor = self.models.pricing_anchor(context, quantity)
-        offer_price = anchor + float(spec.price_offset or 0.0)
-        return QuoteCandidate(spec, float(offer_price), float(quantity))
+        spread = self._effective_spread_info(context, quantity)
+        ratio = float(spec.price_offset_ratio or 0.0)
+        raw_dollar_offset = ratio * spread["spread_unit"]
+        dollar_offset = float(
+            np.clip(
+                raw_dollar_offset,
+                -self.config.max_absolute_price_offset,
+                self.config.max_absolute_price_offset,
+            )
+        )
+        clipped = not math.isclose(raw_dollar_offset, dollar_offset, rel_tol=0.0, abs_tol=1.0e-12)
+        offer_price = anchor + dollar_offset
+        return QuoteCandidate(
+            action=spec,
+            offer_price=float(offer_price),
+            offer_quantity=float(quantity),
+            price_offset_ratio=ratio,
+            price_offset_dollar=dollar_offset,
+            raw_price_offset_dollar=float(raw_dollar_offset),
+            effective_spread=spread["effective_spread"],
+            spread_unit=spread["spread_unit"],
+            spread_source_index=spread["spread_source_index"],
+            spread_is_fallback=spread["spread_is_fallback"],
+            offset_was_clipped=clipped,
+        )
 
     def _quote_life_allows_trigger(self, trigger: str) -> bool:
         if self.active_quote is None or self.config.min_quote_life_minutes <= 0:
@@ -1050,7 +1208,22 @@ class HybridMuniReplayEnv:
             return result
 
         spec = self.action_grid.decode(self.active_quote.action_id)
-        quote = QuoteCandidate(spec, self.active_quote.offer_price, self.active_quote.live_quantity)
+        raw_offset = self.active_quote.price_offset_ratio * self.active_quote.spread_unit
+        quote = QuoteCandidate(
+            action=spec,
+            offer_price=self.active_quote.offer_price,
+            offer_quantity=self.active_quote.live_quantity,
+            price_offset_ratio=self.active_quote.price_offset_ratio,
+            price_offset_dollar=self.active_quote.price_offset_dollar,
+            raw_price_offset_dollar=raw_offset,
+            effective_spread=self.active_quote.effective_spread,
+            spread_unit=self.active_quote.spread_unit,
+            spread_source_index=0.0,
+            spread_is_fallback=0.0,
+            offset_was_clipped=not math.isclose(
+                raw_offset, self.active_quote.price_offset_dollar, rel_tol=0.0, abs_tol=1.0e-12
+            ),
+        )
         haircut = max(float(self.models.customer_price_haircut(context, trade)), 0.0)
         tolerance = max(float(self.models.eligibility_tolerance(context, trade)), 0.0)
         demand_price = trade.price - haircut

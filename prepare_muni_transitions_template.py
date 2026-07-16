@@ -20,9 +20,12 @@ import numpy as np
 import pandas as pd
 
 
-PRICE_OFFSETS: Tuple[float, ...] = (-0.50, -0.25, -0.125, 0.0, 0.125, 0.25, 0.50)
+PRICE_OFFSET_RATIOS: Tuple[float, ...] = (-1.0, -0.50, -0.25, 0.0, 0.25, 0.50, 1.0)
+SPREAD_UNIT_MULTIPLIER: float = 0.50
+SPREAD_FLOOR: float = 0.02
+SPREAD_CAP: float = 4.0
 QUANTITY_FRACTIONS: Tuple[float, ...] = (0.10, 0.25, 0.50, 0.75, 1.00)
-NUM_GRID_ACTIONS = len(PRICE_OFFSETS) * len(QUANTITY_FRACTIONS)
+NUM_GRID_ACTIONS = len(PRICE_OFFSET_RATIOS) * len(QUANTITY_FRACTIONS)
 NO_QUOTE_ACTION_ID = NUM_GRID_ACTIONS
 NUM_ACTIONS = NUM_GRID_ACTIONS + 1
 
@@ -36,6 +39,7 @@ class ColumnConfig:
     logged_offer_price: str = "logged_offer_price"
     logged_offer_qty: str = "logged_offer_qty"
     pricing_anchor_logged_qty: str = "pricing_anchor_logged_qty"
+    effective_spread: str = "effective_bid_ask_spread"
     filled_qty: str = "filled_qty"
     execution_price: str = "execution_price"
     fair_mark: str = "fair_mark"
@@ -70,7 +74,7 @@ def decode_action(action_id: int) -> Tuple[Optional[float], float, bool]:
         return None, 0.0, True
     price_index = action_id // len(QUANTITY_FRACTIONS)
     quantity_index = action_id % len(QUANTITY_FRACTIONS)
-    return PRICE_OFFSETS[price_index], QUANTITY_FRACTIONS[quantity_index], False
+    return PRICE_OFFSET_RATIOS[price_index], QUANTITY_FRACTIONS[quantity_index], False
 
 
 def nearest_logged_action(
@@ -78,12 +82,17 @@ def nearest_logged_action(
     offer_qty: float,
     pricing_anchor: float,
     inventory_before: float,
+    effective_spread: float,
 ) -> int:
     if not np.isfinite(offer_qty) or offer_qty <= 0 or inventory_before <= 0:
         return NO_QUOTE_ACTION_ID
-    price_offset = offer_price - pricing_anchor
+    spread = float(np.clip(effective_spread, SPREAD_FLOOR, SPREAD_CAP))
+    spread_unit = max(SPREAD_UNIT_MULTIPLIER * spread, 1.0e-8)
+    price_offset_ratio = (offer_price - pricing_anchor) / spread_unit
     quantity_fraction = np.clip(offer_qty / inventory_before, 0.0, 1.0)
-    price_index = int(np.argmin(np.abs(np.asarray(PRICE_OFFSETS) - price_offset)))
+    price_index = int(
+        np.argmin(np.abs(np.asarray(PRICE_OFFSET_RATIOS) - price_offset_ratio))
+    )
     quantity_index = int(np.argmin(np.abs(np.asarray(QUANTITY_FRACTIONS) - quantity_fraction)))
     return action_id_from_indices(price_index, quantity_index)
 
@@ -98,7 +107,7 @@ def build_action_mask(inventory: float, min_lot: float) -> np.ndarray:
     mask = np.zeros(NUM_ACTIONS, dtype=bool)
     if inventory <= 0:
         return mask
-    for price_index in range(len(PRICE_OFFSETS)):
+    for price_index in range(len(PRICE_OFFSET_RATIOS)):
         for quantity_index, fraction in enumerate(QUANTITY_FRACTIONS):
             quote_qty = round_down_lot(fraction * inventory, min_lot)
             action_id = action_id_from_indices(price_index, quantity_index)
@@ -144,6 +153,7 @@ def construct_transitions(
         columns.logged_offer_price,
         columns.logged_offer_qty,
         columns.pricing_anchor_logged_qty,
+        columns.effective_spread,
         columns.filled_qty,
         columns.execution_price,
         columns.fair_mark,
@@ -171,14 +181,17 @@ def construct_transitions(
     offer_price = pd.to_numeric(df[columns.logged_offer_price], errors="coerce").to_numpy(float)
     offer_qty = pd.to_numeric(df[columns.logged_offer_qty], errors="coerce").fillna(0.0).to_numpy(float)
     pricing_anchor = pd.to_numeric(df[columns.pricing_anchor_logged_qty], errors="coerce").to_numpy(float)
+    effective_spread = pd.to_numeric(df[columns.effective_spread], errors="raise").to_numpy(float)
     execution_price = pd.to_numeric(df[columns.execution_price], errors="coerce").to_numpy(float)
     fair_mark = pd.to_numeric(df[columns.fair_mark], errors="raise").to_numpy(float)
     next_fair_mark = group[columns.fair_mark].shift(-1).fillna(df[columns.fair_mark]).to_numpy(float)
 
     actions = np.fromiter(
         (
-            nearest_logged_action(p, q, anchor, inv)
-            for p, q, anchor, inv in zip(offer_price, offer_qty, pricing_anchor, inventory_before)
+            nearest_logged_action(p, q, anchor, inv, spread)
+            for p, q, anchor, inv, spread in zip(
+                offer_price, offer_qty, pricing_anchor, inventory_before, effective_spread
+            )
         ),
         dtype=np.int64,
         count=len(df),
@@ -342,7 +355,9 @@ def main() -> None:
         json.dump(
             {
                 "state_cols": state_cols,
-                "price_offsets": PRICE_OFFSETS,
+                "price_offset_ratios": PRICE_OFFSET_RATIOS,
+                "offset_unit": "effective_half_spread",
+                "spread_unit_multiplier": SPREAD_UNIT_MULTIPLIER,
                 "quantity_fractions": QUANTITY_FRACTIONS,
                 "no_quote_action_id": NO_QUOTE_ACTION_ID,
                 "reward_config": reward_cfg.__dict__,

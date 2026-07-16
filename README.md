@@ -1,6 +1,6 @@
-# Municipal Bond Offer Pricing RL - Hybrid Replay Codebase v3
+# Municipal Bond Offer Pricing RL - Hybrid Replay Codebase v4
 
-This codebase implements the **hybrid clock-and-trade-triggered simulator-online design** described in the Version 2.0 report.
+This codebase implements the **hybrid clock-and-trade-triggered simulator-online design** described in the Version 2.0 report, with spread-relative price actions for cross-CUSIP comparability.
 
 It supports two learning stages and one explicit benchmark:
 
@@ -25,7 +25,7 @@ quote active before trade
 
 An own simulated fill is internally observable immediately. Another dealer's trade enters the policy state at its publication/observable time, not automatically at execution time.
 
-## What changed from v1
+## What changed through v4
 
 The original v1 code trained only from fixed transition arrays. Version 2 adds:
 
@@ -44,7 +44,10 @@ The original v1 code trained only from fixed transition arrays. Version 2 adds:
 - decaying CQL during simulator-online fine-tuning;
 - held-out replay evaluation across simulator assumptions;
 - tests for event ordering and fill-capacity logic;
-- a deployable forecast-aware greedy baseline and RL-versus-greedy reporting.
+- a deployable forecast-aware greedy baseline and RL-versus-greedy reporting;
+- spread-relative price actions, where one action ratio is materialized using each CUSIP's point-in-time effective spread;
+- spread floors, caps, fallbacks, source diagnostics, and an absolute business cap;
+- offline logged-action encoding in half-spread units.
 
 ## File map
 
@@ -62,6 +65,7 @@ The original v1 code trained only from fixed transition arrays. Version 2 adds:
 | `column_map.example.json` | Example source-to-canonical column mapping. |
 | `feature_config.example.json` | Existing fixed-transition feature configuration. |
 | `tests/test_hybrid_simulator.py` | Timeline, publication delay, capacity and discount tests. |
+| `tests/test_spread_relative_actions.py` | Cross-CUSIP spread scaling, absolute-cap masking and logged-action encoding tests. |
 
 ## Environment formulation
 
@@ -92,20 +96,49 @@ The first version uses:
 
 ### Action
 
-The default action grid is:
+The default action grid is dimensionless in price:
 
 ```text
-price offsets:      [-0.50, -0.25, -0.125, 0, 0.125, 0.25, 0.50]
-quantity fractions: [0.10, 0.25, 0.50, 0.75, 1.00]
+price offset ratios: [-1.00, -0.50, -0.25, 0, 0.25, 0.50, 1.00]
+quantity fractions:  [0.10, 0.25, 0.50, 0.75, 1.00]
 plus one no-quote action
 ```
 
-There are `7 x 5 + 1 = 36` actions.
+There are `7 x 5 + 1 = 36` actions. The actual dollar adjustment is state-dependent:
 
 ```text
-quote quantity = RoundLot(min(inventory, quantity_fraction * inventory))
-quote price    = PricingModel(CUSIP, time, quote quantity) + price offset
+effective_spread = clip(first valid point-in-time spread source, spread_floor, spread_cap)
+spread_unit      = spread_unit_multiplier * effective_spread
+                  # default multiplier=0.5, so the unit is one half-spread
+raw_offset_$     = price_offset_ratio * spread_unit
+offset_$         = clip(raw_offset_$, -max_absolute_price_offset, +max_absolute_price_offset)
+quote quantity   = RoundLot(min(inventory, quantity_fraction * inventory))
+quote price      = PricingModel(CUSIP, time, quote quantity) + offset_$
 ```
+
+For example, ratio `+0.5` means half of one half-spread more passive than the PricingModel anchor. A CUSIP with a `0.40` full spread gets a `+0.10` dollar offset, while a CUSIP with a `2.00` spread gets `+0.50`.
+
+The default spread source hierarchy is:
+
+```text
+cep_bid_ask_width
+-> predicted_bid_ask_spread
+-> segment_bid_ask_spread
+-> fallback_spread
+```
+
+The simulator records the effective spread, spread unit, source index, fallback flag, ratio, and materialized dollar offset in state/action diagnostics. By default, an action is masked if its raw spread-relative offset would exceed the absolute business cap.
+
+### Logged historical action encoding
+
+For offline CQL warm-start data, historical dollar quotes are converted to the same ratio grid:
+
+```text
+logged_ratio = (historical_offer_price - pricing_anchor)
+             / (spread_unit_multiplier * effective_spread)
+```
+
+The closest ratio and quantity-fraction buckets are used. `prepare_muni_transitions_template.py` now requires an `effective_bid_ask_spread` column and writes `price_offset_ratios` metadata. Old checkpoints trained with absolute-dollar action semantics should not be reused as if the action IDs had the new meaning.
 
 ### Four-layer fill simulator
 
@@ -179,6 +212,23 @@ Each transition stores elapsed time:
 discount_k = gamma_30m ** (elapsed_minutes / 30)
 ```
 
+## Spread-relative configuration
+
+Key training flags:
+
+```bash
+--spread-feature-names cep_bid_ask_width predicted_bid_ask_spread segment_bid_ask_spread
+--spread-floor 0.02
+--spread-cap 4.0
+--fallback-spread 0.50
+--spread-unit-multiplier 0.50
+--max-absolute-price-offset 2.0
+--price-smooth-lambda 0.01
+--price-dollar-smooth-lambda 0.0
+```
+
+Set floors and caps from training-period distributions and business limits rather than treating the example defaults as universal.
+
 ## Canonical replay data
 
 The prepared replay directory contains three tables and one schema.
@@ -208,7 +258,7 @@ observable_time
 fair_mark
 ```
 
-Every feature here must be point-in-time and observable at `observable_time`. A snapshot observable by the episode start is required.
+Every feature here must be point-in-time and observable at `observable_time`. A snapshot observable by the episode start is required. Any feature named in `spread_feature_names` must also be included in `snapshot_feature_cols`, because replay loading retains only configured snapshot features.
 
 ### `trades`
 

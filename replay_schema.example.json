@@ -7,6 +7,7 @@
   ],
   "snapshot_feature_cols": [
     "cep_bid_ask_width",
+    "spread_age_minutes",
     "realized_volatility_30d",
     "liquidity_score",
     "risk_score",

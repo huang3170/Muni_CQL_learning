@@ -50,8 +50,14 @@ def load_checkpoint(path: Path, device: torch.device):
     trainer.target.load_state_dict(checkpoint["target_state_dict"])
     normalizer = StateNormalizer.from_dict(checkpoint["normalizer"])
     grid_payload = checkpoint.get("action_grid", {})
+    if "price_offsets" in grid_payload and "price_offset_ratios" not in grid_payload:
+        raise ValueError(
+            "Checkpoint uses legacy absolute-dollar price_offsets. "
+            "It is not semantically compatible with the v4 spread-relative action grid."
+        )
+    ratio_values = grid_payload.get("price_offset_ratios", ActionGrid().price_offset_ratios)
     action_grid = ActionGrid(
-        price_offsets=tuple(grid_payload.get("price_offsets", ActionGrid().price_offsets)),
+        price_offset_ratios=tuple(ratio_values),
         quantity_fractions=tuple(
             grid_payload.get("quantity_fractions", ActionGrid().quantity_fractions)
         ),
@@ -109,6 +115,7 @@ def replay_episodes(
                 raise ValueError(f"Unknown policy_name={policy_name}")
 
             spec = action_grid.decode(action_id)
+            action_preview = env.preview_action(action_id, simulator_mode=mode)
             result = env.step(action_id)
             step_index += 1
             row: Dict[str, Any] = {
@@ -120,7 +127,10 @@ def replay_episodes(
                 "next_decision_time": result.info["interval_end"],
                 "elapsed_minutes": result.elapsed_minutes,
                 "action_id": action_id,
-                "price_offset": spec.price_offset,
+                "price_offset_ratio": spec.price_offset_ratio,
+                "price_offset_dollar": action_preview["price_offset_dollar"],
+                "effective_spread": action_preview["effective_spread"],
+                "spread_unit": action_preview["spread_unit"],
                 "quantity_fraction": spec.quantity_fraction,
                 "is_no_quote": spec.is_no_quote,
                 "policy_action_value": selected_value,

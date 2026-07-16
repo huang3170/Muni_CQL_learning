@@ -319,6 +319,7 @@ def make_demo(output_dir: Path, episodes: int, seed: int) -> None:
                     "observable_time": time,
                     "fair_mark": mark,
                     "cep_bid_ask_width": max(rng.normal(0.35, 0.08), 0.05),
+                    "spread_age_minutes": float(rng.integers(0, 16)),
                     "realized_volatility_30d": max(rng.normal(0.45, 0.12), 0.05),
                     "liquidity_score": rng.normal(),
                     "risk_score": max(rng.normal(1.0, 0.15), 0.25),
@@ -358,6 +359,7 @@ def make_demo(output_dir: Path, episodes: int, seed: int) -> None:
         ],
         "snapshot_feature_cols": [
             "cep_bid_ask_width",
+            "spread_age_minutes",
             "realized_volatility_30d",
             "liquidity_score",
             "risk_score",

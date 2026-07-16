@@ -28,6 +28,19 @@ class ProductionModelBundle:
         # Replace with your feature pipeline and PricingModel inference.
         return context.fair_mark + 0.20
 
+    def effective_spread(self, context: ModelContext, quantity: float) -> float:
+        """Optional quantity-aware full bid-ask spread used to materialize actions.
+
+        The simulator computes::
+
+            price_offset_dollar = price_offset_ratio * 0.5 * effective_spread
+
+        by default. If this method is omitted, the simulator falls back through
+        configured point-in-time snapshot spread features.
+        """
+        del quantity
+        return max(float(context.snapshot_features.get("cep_bid_ask_width", 0.50)), 0.02)
+
     def pretrade_win_probability(self, context: ModelContext, quote: QuoteCandidate) -> float:
         """Calibrated action-grid score used as a policy-state feature.
 
@@ -49,6 +62,9 @@ class ProductionModelBundle:
         """P(win positive flow | demand, eligible, state, action, event)."""
         # The policy did not see `trade` when choosing `quote`; only the simulator
         # may use it after the action was fixed.
+        # The quote also exposes spread-normalized and dollar price locations:
+        # quote.price_offset_ratio, quote.price_offset_dollar,
+        # quote.effective_spread, and quote.spread_unit.
         price_advantage = demand_price - quote.offer_price
         return float(np.clip(0.10 + 0.40 * max(price_advantage, 0.0), 0.001, 0.999))
 
