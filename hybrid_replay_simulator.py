@@ -704,6 +704,70 @@ class HybridMuniReplayEnv:
             info=info,
         )
 
+    def preview_action(self, action_id: int, simulator_mode: Optional[str] = None) -> Dict[str, float]:
+        """Return point-in-time, pre-trade action diagnostics without mutating the environment.
+
+        The preview deliberately uses only information observable at the current
+        decision time.  It never inspects the next historical trade.  This makes
+        it suitable for deployable greedy/model-based baselines as well as policy
+        diagnostics.
+        """
+        mask = self.action_mask()
+        if action_id < 0 or action_id >= self.action_grid.num_actions or not bool(mask[action_id]):
+            raise ValueError(f"Invalid action_id={action_id} at {self.current_time}")
+        mode = simulator_mode or self.config.simulator_mode
+        if mode not in {"optimistic", "win_only", "partial"}:
+            raise ValueError("simulator_mode must be optimistic, win_only, or partial")
+
+        context = self._model_context()
+        spec = self.action_grid.decode(action_id)
+        if spec.is_no_quote:
+            return {
+                "action_id": float(action_id),
+                "is_no_quote": 1.0,
+                "price_offset": 0.0,
+                "quantity_fraction": 0.0,
+                "offer_price": math.nan,
+                "offer_quantity": 0.0,
+                "win_probability": 0.0,
+                "participation_share": 0.0,
+                "expected_fill_quantity": 0.0,
+                "expected_remaining_inventory": float(self.inventory),
+                "support_score": 1.0,
+            }
+
+        quote = self._candidate_from_spec(context, spec)
+        if mode == "optimistic":
+            p_win = 1.0
+            share = 1.0
+        else:
+            p_win = _clip_probability(self.models.pretrade_win_probability(context, quote))
+            share = (
+                1.0
+                if mode == "win_only"
+                else float(np.clip(self.models.pretrade_participation_share(context, quote), 0.0, 1.0))
+            )
+        expected_fill = min(self.inventory, quote.offer_quantity) * p_win * share
+        expected_fill = max(min(expected_fill, self.inventory, quote.offer_quantity), 0.0)
+        support = float(np.clip(self.models.support_score(context, quote), 0.0, 1.0))
+        return {
+            "action_id": float(action_id),
+            "is_no_quote": 0.0,
+            "price_offset": float(spec.price_offset or 0.0),
+            "quantity_fraction": float(spec.quantity_fraction),
+            "offer_price": float(quote.offer_price),
+            "offer_quantity": float(quote.offer_quantity),
+            "win_probability": float(p_win),
+            "participation_share": float(share),
+            "expected_fill_quantity": float(expected_fill),
+            "expected_remaining_inventory": float(max(self.inventory - expected_fill, 0.0)),
+            "support_score": support,
+        }
+
+    def target_inventory_at(self, time: pd.Timestamp) -> float:
+        """Public read-only wrapper for the episode's linear inventory schedule."""
+        return float(self._target_inventory(time))
+
     def build_state(self) -> np.ndarray:
         context = self._model_context()
         values: List[float] = []

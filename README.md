@@ -1,11 +1,12 @@
-# Municipal Bond Offer Pricing RL - Hybrid Replay Codebase v2
+# Municipal Bond Offer Pricing RL - Hybrid Replay Codebase v3
 
 This codebase implements the **hybrid clock-and-trade-triggered simulator-online design** described in the Version 2.0 report.
 
-It supports two learning stages:
+It supports two learning stages and one explicit benchmark:
 
 1. **Optional offline CQL warm start** from fixed historical internal quote transitions.
 2. **Simulator-online Dueling Double DQN fine-tuning** in a historical MSRB replay environment, with optional mixing of historical transitions and a decaying CQL penalty.
+3. **Forecast-aware one-step greedy baseline** that evaluates all 36 valid actions from point-in-time Pricing/Fill/ForwardPrice signals without looking at the next historical trade.
 
 The code is a research starter, not a production execution system. The included heuristic Pricing/Win/Participation models exist only so the pipeline can run end to end. Replace them with calibrated internal models before interpreting results.
 
@@ -42,7 +43,8 @@ The original v1 code trained only from fixed transition arrays. Version 2 adds:
 - optional historical/simulator mixed replay;
 - decaying CQL during simulator-online fine-tuning;
 - held-out replay evaluation across simulator assumptions;
-- tests for event ordering and fill-capacity logic.
+- tests for event ordering and fill-capacity logic;
+- a deployable forecast-aware greedy baseline and RL-versus-greedy reporting.
 
 ## File map
 
@@ -52,7 +54,8 @@ The original v1 code trained only from fixed transition arrays. Version 2 adds:
 | `simulator_online_train.py` | Replay buffer, simulator-online Dueling Double DQN training, mixed historical replay, CQL decay, evaluation and checkpoints. |
 | `prepare_hybrid_replay_data.py` | Converts position, point-in-time snapshot and trade tables into the canonical replay directory. Also creates demo data. |
 | `model_adapter_template.py` | Interface for connecting your PricingModel, WinModel and ParticipationShareModel. |
-| `evaluate_hybrid_policy.py` | Standalone held-out evaluation and episode-level replay export. |
+| `evaluate_hybrid_policy.py` | Standalone RL/greedy held-out evaluation, comparison metrics and episode-level replay export. |
+| `greedy_baseline.py` | Forecast-aware one-step expected-value policy, action diagnostics and held-out baseline evaluation. |
 | `muni_cql_dueling_ddqn.py` | Offline CQL-Dueling-Double-DQN trainer and reusable neural Q-function trainer. |
 | `prepare_muni_transitions_template.py` | Existing template for fixed offline transition construction. |
 | `replay_schema.example.json` | Static and snapshot feature configuration for simulator states. |
@@ -136,6 +139,37 @@ execution P&L
 ```
 
 ForwardPriceModel predictions belong in the state. Realized future mark changes belong in the reward.
+
+## Forecast-aware greedy baseline
+
+The greedy policy is a **deployable myopic baseline**, not a trade oracle. At each decision time it scores every valid action using only information currently observable:
+
+```text
+expected execution value
++ forecast value of expected remaining inventory
+- inventory carrying risk
+- target-schedule shortfall
+- quote smoothness and update cost
+```
+
+For action `a`:
+
+```text
+expected_fill(a) = offer_quantity(a)
+                 * pretrade_win_probability(a)
+                 * pretrade_participation_share(a)
+
+greedy_score(a) = expected_fill(a) / 100
+                * (offer_price(a) - fair_mark)
+                + expected_remaining_inventory(a) / 100
+                * forward_price_change_4h
+                * forward_model_confidence
+                - one_step_penalties(a)
+```
+
+The baseline does **not** inspect the next trade price or quantity. The environment's `preview_action()` method uses only current point-in-time features and pre-trade side-model outputs. In contrast, the neural Q-policy estimates long-horizon discounted value across future inventory states and quote opportunities.
+
+Training automatically writes `greedy_baseline_evaluation.json` unless `--skip-greedy-baseline-evaluation` is supplied. Validation logs include RL-minus-greedy return, fill and ending-inventory differences.
 
 ### Variable time discount
 
@@ -291,7 +325,7 @@ python simulator_online_train.py \
   --train-replay-dir replay/train \
   --valid-replay-dir replay/valid \
   --model-factory my_model_adapter:build_models \
-  --output-dir checkpoints/hybrid_v2 \
+  --output-dir checkpoints/hybrid_v3 \
   --train-episodes 1000 \
   --device cuda
 ```
@@ -321,7 +355,7 @@ python simulator_online_train.py \
   --warmstart-checkpoint checkpoints/offline_cql/best_checkpoint.pt \
   --offline-transitions transitions/train \
   --model-factory my_model_adapter:build_models \
-  --output-dir checkpoints/hybrid_v2 \
+  --output-dir checkpoints/hybrid_v3 \
   --cql-alpha-start 0.5 \
   --cql-alpha-end 0.05 \
   --historical-fraction-start 0.5 \
@@ -342,19 +376,34 @@ training_log.jsonl
 training_summary.json
 run_config.json
 state_feature_names.json
+greedy_baseline_evaluation.json
 ```
 
-A saved checkpoint can be evaluated separately with:
+A saved checkpoint can be compared with the greedy baseline using the same held-out episodes, simulator assumptions and reward:
 
 ```bash
 python evaluate_hybrid_policy.py \
-  --checkpoint checkpoints/hybrid_v2/best_simulator_online_checkpoint.pt \
+  --checkpoint checkpoints/hybrid_v3/best_simulator_online_checkpoint.pt \
   --replay-dir replay/test \
   --model-factory my_model_adapter:build_models \
-  --output-json checkpoints/hybrid_v2/test_metrics.json \
-  --replay-csv checkpoints/hybrid_v2/test_replay.csv \
+  --policies rl greedy \
+  --output-json checkpoints/hybrid_v3/test_metrics.json \
+  --replay-csv checkpoints/hybrid_v3/greedy_replay.csv \
+  --replay-policy greedy \
   --device cuda
 ```
+
+Evaluate the greedy baseline alone, without an RL checkpoint:
+
+```bash
+python evaluate_hybrid_policy.py \
+  --replay-dir replay/test \
+  --model-factory my_model_adapter:build_models \
+  --policies greedy \
+  --output-json checkpoints/greedy_only_metrics.json
+```
+
+Useful baseline controls include `--greedy-forecast-weight`, `--greedy-forward-change-feature`, `--greedy-forward-confidence-feature`, and switches that remove inventory, schedule, smoothness or update-cost terms for ablation studies.
 
 The best checkpoint is selected using mean return in the held-out **partial-fill** simulator. This is still not evidence of real-market value. Policy promotion requires chronological backtesting, cold-CUSIP evaluation, simulator sensitivity analysis and shadow mode.
 
@@ -376,3 +425,4 @@ The best checkpoint is selected using mean return in the held-out **partial-fill
 - van Hasselt et al., *Deep Reinforcement Learning with Double Q-learning*, AAAI 2016.
 - Wang et al., *Dueling Network Architectures for Deep Reinforcement Learning*, ICML 2016.
 - Sutton, Precup and Singh, *Between MDPs and Semi-MDPs*, Artificial Intelligence 1999.
+- Mnih et al., *Human-level control through deep reinforcement learning*, Nature 2015.

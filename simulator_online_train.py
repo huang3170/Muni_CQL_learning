@@ -26,6 +26,11 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from greedy_baseline import (
+    GreedyBaselineConfig,
+    compare_policy_metrics,
+    evaluate_greedy_policy,
+)
 from hybrid_replay_simulator import (
     HybridMuniReplayEnv,
     ReplayDataset,
@@ -472,6 +477,20 @@ def run_training(args: argparse.Namespace) -> None:
         terminal_lambda=args.terminal_lambda,
         liquidation_concession=args.liquidation_concession,
     )
+    greedy_config = GreedyBaselineConfig(
+        planning_minutes=args.greedy_planning_minutes,
+        forward_change_feature_name=args.greedy_forward_change_feature,
+        forward_confidence_feature_name=args.greedy_forward_confidence_feature,
+        forecast_weight=args.greedy_forecast_weight,
+        use_forecast_confidence=not args.greedy_ignore_forecast_confidence,
+        confidence_floor=args.greedy_confidence_floor,
+        confidence_cap=args.greedy_confidence_cap,
+        expected_fill_multiplier=args.greedy_expected_fill_multiplier,
+        include_inventory_penalty=not args.greedy_no_inventory_penalty,
+        include_schedule_penalty=not args.greedy_no_schedule_penalty,
+        include_smoothness_penalty=not args.greedy_no_smoothness_penalty,
+        include_update_cost=not args.greedy_no_update_cost,
+    )
     online_config = OnlineConfig(
         seed=args.seed,
         train_episodes=args.train_episodes,
@@ -579,6 +598,7 @@ def run_training(args: argparse.Namespace) -> None:
                 "online_config": asdict(online_config),
                 "simulator_config": asdict(simulator_config),
                 "reward_config": asdict(reward_config),
+                "greedy_baseline_config": asdict(greedy_config),
                 "action_grid": action_grid.to_json_dict(),
                 "state_dim": state_dim,
             },
@@ -588,6 +608,33 @@ def run_training(args: argparse.Namespace) -> None:
     )
 
     metrics_path = output_dir / "training_log.jsonl"
+    greedy_baseline_evaluation: Dict[str, Any] = {}
+    if not args.skip_greedy_baseline_evaluation:
+        LOGGER.info("evaluating forecast-aware greedy baseline on held-out replay")
+        greedy_baseline_evaluation = evaluate_greedy_policy(
+            valid_data,
+            valid_data.episodes,
+            models,
+            action_grid,
+            simulator_config,
+            reward_config,
+            greedy_config,
+            online_config.evaluation_modes,
+            online_config.evaluation_max_episodes,
+            seed=args.seed + 40_000,
+        )
+        (output_dir / "greedy_baseline_evaluation.json").write_text(
+            json.dumps(
+                {
+                    "policy": "forecast_aware_one_step_greedy",
+                    "greedy_config": asdict(greedy_config),
+                    "evaluation": greedy_baseline_evaluation,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     best_path = output_dir / "best_simulator_online_checkpoint.pt"
     latest_path = output_dir / "latest_simulator_online_checkpoint.pt"
     best_partial_return = -math.inf
@@ -744,6 +791,12 @@ def run_training(args: argparse.Namespace) -> None:
                 "episode_index": episode_index,
                 "environment_steps": environment_steps,
                 "evaluation": evaluation,
+                "greedy_baseline": greedy_baseline_evaluation,
+                "rl_vs_greedy": (
+                    compare_policy_metrics(evaluation, greedy_baseline_evaluation)
+                    if greedy_baseline_evaluation
+                    else {}
+                ),
             }
             with metrics_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
@@ -811,6 +864,10 @@ def run_training(args: argparse.Namespace) -> None:
         "wall_seconds": time.time() - start_wall,
         "best_checkpoint": str(best_path),
         "latest_checkpoint": str(latest_path),
+        "greedy_baseline_evaluation": greedy_baseline_evaluation,
+        "greedy_baseline_path": str(output_dir / "greedy_baseline_evaluation.json")
+        if greedy_baseline_evaluation
+        else None,
     }
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
@@ -891,6 +948,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--liquidation-concession", type=float, default=0.50)
     parser.add_argument("--reward-scale", type=float, default=1.0)
     parser.add_argument("--reward-clip", type=float, default=10.0)
+
+    parser.add_argument("--skip-greedy-baseline-evaluation", action="store_true")
+    parser.add_argument("--greedy-planning-minutes", type=float, default=30.0)
+    parser.add_argument(
+        "--greedy-forward-change-feature", default="forward_price_change_4h"
+    )
+    parser.add_argument(
+        "--greedy-forward-confidence-feature", default="forward_model_confidence"
+    )
+    parser.add_argument("--greedy-forecast-weight", type=float, default=1.0)
+    parser.add_argument("--greedy-ignore-forecast-confidence", action="store_true")
+    parser.add_argument("--greedy-confidence-floor", type=float, default=0.0)
+    parser.add_argument("--greedy-confidence-cap", type=float, default=1.0)
+    parser.add_argument("--greedy-expected-fill-multiplier", type=float, default=1.0)
+    parser.add_argument("--greedy-no-inventory-penalty", action="store_true")
+    parser.add_argument("--greedy-no-schedule-penalty", action="store_true")
+    parser.add_argument("--greedy-no-smoothness-penalty", action="store_true")
+    parser.add_argument("--greedy-no-update-cost", action="store_true")
 
     parser.add_argument("--evaluation-interval-episodes", type=int, default=25)
     parser.add_argument("--evaluation-max-episodes", type=int, default=50)

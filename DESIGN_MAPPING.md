@@ -22,3 +22,7 @@
 | Simulator variants | `optimistic`, `win_only`, `partial` |
 | Out-of-time evaluation | `evaluate_hybrid_policy.py` and training-time validation |
 | Production model integration | `model_adapter_template.py` |
+
+| Forecast-aware greedy baseline | `greedy_baseline.ForecastAwareGreedyPolicy` |
+| Point-in-time action preview | `HybridMuniReplayEnv.preview_action` |
+| RL-versus-greedy held-out comparison | `evaluate_hybrid_policy.py` and training-time `greedy_baseline_evaluation.json` |

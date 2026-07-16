@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.0
+
+- Added a forecast-aware one-step greedy expected-value baseline over all 36 actions.
+- Added non-mutating, point-in-time `HybridMuniReplayEnv.preview_action()` diagnostics.
+- Added RL-versus-greedy evaluation under optimistic, win-only and partial-fill assumptions.
+- Added greedy replay CSV exports with per-action score components.
+- Added automatic held-out greedy evaluation during simulator-online training.
+- Added CLI controls for forecast weight/confidence and penalty ablations.
+- Added tests proving the greedy policy does not inspect the next trade and reacts directionally to forward-price signals.
+
 ## v2.0
 
 - Added hybrid 30-minute, own-fill, and trade-publication quote triggers.

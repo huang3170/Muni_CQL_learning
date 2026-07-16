@@ -31,9 +31,11 @@ class ProductionModelBundle:
     def pretrade_win_probability(self, context: ModelContext, quote: QuoteCandidate) -> float:
         """Calibrated action-grid score used as a policy-state feature.
 
-        This must not use the next trade price or quantity. It may be an
-        unconditional fill probability or a demand-conditional score estimated
-        from currently observable information.
+        This must not use the next trade price or quantity. For the greedy
+        baseline, calibrate it to the configured planning window (30 minutes by
+        default). It may be an unconditional any-fill probability, or a
+        demand-conditional score combined with a separate arrival estimate, as
+        long as the returned value has the intended expected-fill interpretation.
         """
         return 0.02
 
