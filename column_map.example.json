@@ -1,0 +1,22 @@
+{
+  "positions": {
+    "POSITION_ID": "episode_id",
+    "CUSIP_ID": "cusip",
+    "POSITION_START": "start_time",
+    "POSITION_END": "end_time",
+    "START_PAR": "starting_inventory",
+    "BOOK_PRICE": "cost_basis"
+  },
+  "snapshots": {
+    "AS_OF_TIME": "observable_time",
+    "MID_PRICE": "fair_mark"
+  },
+  "trades": {
+    "TRADE_ID": "event_id",
+    "TIME_OF_TRADE": "execution_time",
+    "RTRS_PUBLISH_TIME": "publish_time",
+    "DOLLAR_PRICE": "trade_price",
+    "PAR_TRADED": "trade_quantity",
+    "TRADE_TYPE_INDICATOR": "trade_type"
+  }
+}

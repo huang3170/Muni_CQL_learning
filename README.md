@@ -1,253 +1,378 @@
-# Muni Offer Pricing：CQL-Regularized Dueling Double DQN 第一版
+# Municipal Bond Offer Pricing RL - Hybrid Replay Codebase v2
 
-这是一套可运行的 **offline reinforcement learning** starter code，目标是学习：
+This codebase implements the **hybrid clock-and-trade-triggered simulator-online design** described in the Version 2.0 report.
 
-\[
-a_t=(\Delta p_t,\rho_t)
-\]
+It supports two learning stages:
 
-其中：
+1. **Optional offline CQL warm start** from fixed historical internal quote transitions.
+2. **Simulator-online Dueling Double DQN fine-tuning** in a historical MSRB replay environment, with optional mixing of historical transitions and a decaying CQL penalty.
 
-- `Δp`：相对 PricingModel 输出的 offer-price offset；
-- `ρ`：当前 inventory 的 offer quantity fraction；
-- 额外包含一个 `no quote` action。
+The code is a research starter, not a production execution system. The included heuristic Pricing/Win/Participation models exist only so the pipeline can run end to end. Replace them with calibrated internal models before interpreting results.
 
-默认 action grid：
+## Core event-ordering rule
 
-- Price offsets：`[-0.50, -0.25, -0.125, 0, 0.125, 0.25, 0.50]`
-- Quantity fractions：`[0.10, 0.25, 0.50, 0.75, 1.00]`
-- Action 数量：`7 × 5 + 1 = 36`
+The central leakage control is:
 
-## 文件
+```text
+quote active before trade
+        -> processes that trade
+        -> fill and inventory are updated
+        -> external trade becomes observable at publish time
+        -> policy may refresh the quote
+        -> refreshed quote affects only later events
+```
 
-- `muni_cql_dueling_ddqn.py`：主训练、验证、checkpoint 和单状态 inference。
-- `prepare_muni_transitions_template.py`：把 decision-level dataframe 转成 offline transition arrays 的模板。
-- `feature_config.example.json`：state feature 顺序示例。
-- `requirements.txt`：依赖。
+An own simulated fill is internally observable immediately. Another dealer's trade enters the policy state at its publication/observable time, not automatically at execution time.
 
-## 模型结构
+## What changed from v1
 
-### Dueling Q-network
+The original v1 code trained only from fixed transition arrays. Version 2 adds:
 
-网络分为：
+- one-CUSIP position-lifecycle episodes;
+- mandatory 30-minute quote refreshes;
+- immediate re-quote after an own simulated fill;
+- re-quote when a same-CUSIP trade becomes observable;
+- separate trade execution time and publication time;
+- irregular semi-Markov transitions with per-transition discounts;
+- four-layer fill simulation: demand, eligibility, win, participation share;
+- optimistic, win-only, and partial-fill simulator variants;
+- dynamic inventory and live-quote quantity updates;
+- quote-update and smoothness costs;
+- simulator replay buffer and epsilon-greedy interaction;
+- optional historical/simulator mixed replay;
+- decaying CQL during simulator-online fine-tuning;
+- held-out replay evaluation across simulator assumptions;
+- tests for event ordering and fill-capacity logic.
 
-- `V(s)`：当前 inventory/market state 的整体价值；
-- `A(s,a)`：某个报价 action 相对其他 action 的优势。
+## File map
 
-合并方式：
+| File | Purpose |
+|---|---|
+| `hybrid_replay_simulator.py` | Hybrid historical replay environment, state construction, action masks, four-layer fill logic, reward and terminal handling. |
+| `simulator_online_train.py` | Replay buffer, simulator-online Dueling Double DQN training, mixed historical replay, CQL decay, evaluation and checkpoints. |
+| `prepare_hybrid_replay_data.py` | Converts position, point-in-time snapshot and trade tables into the canonical replay directory. Also creates demo data. |
+| `model_adapter_template.py` | Interface for connecting your PricingModel, WinModel and ParticipationShareModel. |
+| `evaluate_hybrid_policy.py` | Standalone held-out evaluation and episode-level replay export. |
+| `muni_cql_dueling_ddqn.py` | Offline CQL-Dueling-Double-DQN trainer and reusable neural Q-function trainer. |
+| `prepare_muni_transitions_template.py` | Existing template for fixed offline transition construction. |
+| `replay_schema.example.json` | Static and snapshot feature configuration for simulator states. |
+| `column_map.example.json` | Example source-to-canonical column mapping. |
+| `feature_config.example.json` | Existing fixed-transition feature configuration. |
+| `tests/test_hybrid_simulator.py` | Timeline, publication delay, capacity and discount tests. |
 
-\[
-Q(s,a)=V(s)+A(s,a)-\operatorname{mean}_{a'\in A_{valid}}A(s,a')
-\]
+## Environment formulation
 
-### Double DQN target
+### Episode
 
-Online network 选择 next action，target network 估值：
+```text
+(CUSIP, position start time, starting inventory)
+```
 
-\[
-a^*=\arg\max_{a'}Q_\theta(s',a')
-\]
+The episode ends when:
 
-\[
-y=r+\gamma Q_{\bar\theta}(s',a^*)
-\]
+- inventory reaches zero;
+- the maximum position horizon is reached;
+- the event queue ends;
+- the maximum decision count is reached.
 
-### Discrete CQL regularizer
+### Decision triggers
 
-\[
-L_{CQL}=\alpha\left[\tau\log\sum_{a\in A_{valid}}
-\exp(Q(s,a)/\tau)-Q(s,a_{logged})\right]
-\]
+```text
+T_decision = T_clock U T_own_fill U T_trade_publish
+```
 
-最终损失：
+The first version uses:
 
-\[
-L=L_{Huber\ TD}+L_{CQL}
-\]
+- every 30 minutes;
+- immediately after a positive simulated fill;
+- when a relevant same-CUSIP trade becomes observable.
 
-## Transition 数据格式
+### Action
 
-训练脚本支持两种输入：
+The default action grid is:
 
-1. 单个 `.npz` 文件；
-2. 一个目录，每个 array 单独保存为 `.npy`。**大数据推荐第二种**，因为 `.npy` 可 memory-map。
+```text
+price offsets:      [-0.50, -0.25, -0.125, 0, 0.125, 0.25, 0.50]
+quantity fractions: [0.10, 0.25, 0.50, 0.75, 1.00]
+plus one no-quote action
+```
 
-必须包含：
+There are `7 x 5 + 1 = 36` actions.
 
-| Array | Shape | 类型 | 说明 |
-|---|---:|---|---|
-| `states` | `[N, state_dim]` | float32 | 当前 state |
-| `actions` | `[N]` | int64 | 历史 logged action ID |
-| `rewards` | `[N]` | float32 | 该 transition reward |
-| `next_states` | `[N, state_dim]` | float32 | 下一 state |
-| `dones` | `[N]` | float/bool | episode 是否结束 |
-| `action_masks` | `[N, 36]` | bool | 当前 state 有效 action |
-| `next_action_masks` | `[N, 36]` | bool | 下一 state 有效 action |
-| `discounts` | `[N]` | float32 | 可选，event-driven 时间折扣 |
+```text
+quote quantity = RoundLot(min(inventory, quantity_fraction * inventory))
+quote price    = PricingModel(CUSIP, time, quote quantity) + price offset
+```
 
-对于不规则时间间隔，建议：
+### Four-layer fill simulator
 
-\[
-\gamma_t=\gamma_{base}^{\Delta t/base\_minutes}
-\]
+For a relevant trade event:
 
-## State 建议顺序
+```text
+Demand:       D = 1
+Eligibility:  E = 1[offer_price <= trade_price - haircut + tolerance]
+Win:          Z ~ Bernoulli(p_win)
+Capacity:     C = min(inventory, live_offer_quantity, trade_quantity)
+Fill:         q_fill = D * E * Z * RoundLot(C * participation_share)
+```
 
-你的 state vector 可以包括：
+Use `--quantity-model-definition participation_share` for the report's preferred capacity-share label, or `displayed_quote_ratio` to retain a legacy label defined as filled quantity divided by displayed quote quantity.
 
-1. bond static：coupon、maturity、duration、rating、sector、state、tax status、call features；
-2. market：CEP、curve、recent MSRB trade、volume、imbalance、volatility、liquidity regime；
-3. inventory：current inventory、fraction remaining、position age、cost、unrealized P&L、target inventory；
-4. time：time of day、time to close、time to deadline、delta time；
-5. PricingModel grid outputs；
-6. FillModel calibrated probability/fill-ratio grid；
-7. ForwardPriceModel output and confidence；
-8. previous quote/action/fill history。
+The simulator execution price is the **agent offer price**, not the higher historical trade price.
 
-所有 state feature 必须是 **point-in-time**，且训练/验证 feature 顺序必须一致。
+### Reward
 
-## Reward 模板
+The environment accumulates:
 
-`prepare_muni_transitions_template.py` 默认使用：
+```text
+execution P&L
++ mark-to-market of remaining inventory
+- time-scaled inventory risk
+- target-inventory schedule shortfall
+- price/quantity smoothness
+- quote-update cost
+- optional underpricing and missed-demand terms
+- terminal liquidation cost and terminal inventory penalty
+```
 
-\[
-R^{wealth}_t=
-q^{fill}_t(p^{exec}_t-m_t)
-+I_{t+1}(m_{t+1}-m_t)
-\]
+ForwardPriceModel predictions belong in the state. Realized future mark changes belong in the reward.
 
-然后扣除：
+### Variable time discount
 
-- inventory-risk penalty；
-- target-inventory schedule penalty；
-- quote price/quantity instability；
-- observed demand 下的 missed-quantity penalty；
-- 可选 underpricing penalty。
+Each transition stores elapsed time:
 
-第一版建议将 `underpricing_lambda=0`，先避免与 execution P&L 重复惩罚。
+```text
+discount_k = gamma_30m ** (elapsed_minutes / 30)
+```
 
-## 1. 安装
+## Canonical replay data
+
+The prepared replay directory contains three tables and one schema.
+
+### `positions`
+
+Required columns:
+
+```text
+episode_id
+cusip
+start_time
+end_time
+starting_inventory
+cost_basis
+```
+
+Static features listed in `schema.json` are also required.
+
+### `snapshots`
+
+Required columns:
+
+```text
+episode_id
+observable_time
+fair_mark
+```
+
+Every feature here must be point-in-time and observable at `observable_time`. A snapshot observable by the episode start is required.
+
+### `trades`
+
+Required columns:
+
+```text
+episode_id
+event_id
+execution_time
+publish_time
+trade_price
+trade_quantity
+trade_type
+```
+
+For a dealer selling inventory, `S` trades are the default demand proxy. `D` trades should normally be calibrated separately. Quantity and price units must be consistent across inventory, quotes and trades.
+
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 2. Smoke test
+If `pyarrow` is unavailable, the preparation script falls back to pickle files for demos. Parquet is recommended for real datasets.
 
-生成 synthetic data：
+## Run unit tests
 
 ```bash
-python muni_cql_dueling_ddqn.py make-demo \
-  --output-dir demo_data \
-  --train-rows 50000 \
-  --valid-rows 10000 \
-  --state-dim 64
+python -m unittest discover -s tests -v
 ```
 
-训练：
+The tests verify:
+
+- the old quote handles the trade that triggers a refresh;
+- external trade information triggers a decision at publish time;
+- partial fill equals feasible capacity times participation share;
+- no-trade clock decisions remain in the episode;
+- variable elapsed time produces the expected discount.
+
+## End-to-end demo
 
 ```bash
-python muni_cql_dueling_ddqn.py train \
-  --train-npz demo_data/demo_train.npz \
-  --valid-npz demo_data/demo_valid.npz \
+./run_demo.sh
+```
+
+A smaller smoke run:
+
+```bash
+python prepare_hybrid_replay_data.py make-demo \
+  --output-dir demo_train \
+  --episodes 12
+
+python prepare_hybrid_replay_data.py make-demo \
+  --output-dir demo_valid \
+  --episodes 5 \
+  --seed 3026
+
+python simulator_online_train.py \
+  --train-replay-dir demo_train \
+  --valid-replay-dir demo_valid \
   --output-dir demo_output \
-  --epochs 10 \
-  --batch-size 1024 \
-  --cql-alpha 1.0 \
+  --train-episodes 10 \
+  --replay-warmup 100 \
+  --batch-size 64 \
+  --evaluation-interval-episodes 5 \
   --device auto
 ```
 
-## 3. 准备真实 muni transition data
+## Prepare real replay data
 
-先编辑 `feature_config.example.json`，确保 state columns 都是 numeric、point-in-time、已经完成 missing-value handling。
-
-```bash
-python prepare_muni_transitions_template.py \
-  --input-data train_decisions.parquet \
-  --feature-config feature_config.example.json \
-  --output-dir transitions/train
-```
-
-对 validation period 单独运行：
+First edit `replay_schema.example.json`, then normalize your source tables:
 
 ```bash
-python prepare_muni_transitions_template.py \
-  --input-data valid_decisions.parquet \
-  --feature-config feature_config.example.json \
-  --output-dir transitions/valid
+python prepare_hybrid_replay_data.py prepare \
+  --positions positions.parquet \
+  --snapshots point_in_time_snapshots.parquet \
+  --trades msrb_trades.parquet \
+  --schema-json replay_schema.example.json \
+  --column-map-json column_map.example.json \
+  --output-dir replay/train \
+  --default-publish-lag-minutes 15 \
+  --allowed-trade-types S
 ```
 
-然后训练：
+Prepare a strictly later validation period separately:
+
+```bash
+python prepare_hybrid_replay_data.py prepare \
+  --positions valid_positions.parquet \
+  --snapshots valid_snapshots.parquet \
+  --trades valid_msrb_trades.parquet \
+  --schema-json replay_schema.example.json \
+  --column-map-json column_map.example.json \
+  --output-dir replay/valid \
+  --allowed-trade-types S
+```
+
+## Connect production side models
+
+Copy `model_adapter_template.py` and replace the placeholders.
+
+The adapter must provide:
+
+- `pricing_anchor(context, quantity)`;
+- pre-trade win/share scores for action-grid state features;
+- event-conditioned win probability and participation share;
+- customer-price haircut and eligibility tolerance;
+- optional support score for action masking.
+
+Run with:
+
+```bash
+python simulator_online_train.py \
+  --train-replay-dir replay/train \
+  --valid-replay-dir replay/valid \
+  --model-factory my_model_adapter:build_models \
+  --output-dir checkpoints/hybrid_v2 \
+  --train-episodes 1000 \
+  --device cuda
+```
+
+## Optional offline-to-simulator-online workflow
+
+### 1. Train the existing offline warm start
 
 ```bash
 python muni_cql_dueling_ddqn.py train \
   --train-npz transitions/train \
   --valid-npz transitions/valid \
-  --output-dir checkpoints/muni_cql_v1 \
+  --output-dir checkpoints/offline_cql \
   --epochs 30 \
-  --batch-size 2048 \
-  --learning-rate 3e-4 \
   --cql-alpha 1.0 \
-  --target-update-interval 1000 \
-  --reward-scale 100.0 \
-  --reward-clip 10 \
   --device cuda
 ```
 
-`reward-scale` 应使大部分 scaled reward 落在大约 `[-5, 5]`，而不是机械使用示例中的 100。
+The offline transition state schema must exactly match the simulator state schema if the checkpoint or historical transitions are reused.
 
-## 4. Inference
-
-输入：
-
-- `state.npy`：一个原始、未标准化 state；
-- `mask.npy`：一个 bool action mask。
+### 2. Fine-tune in the simulator
 
 ```bash
-python muni_cql_dueling_ddqn.py infer \
-  --checkpoint checkpoints/muni_cql_v1/best_checkpoint.pt \
-  --state-npy state.npy \
-  --mask-npy mask.npy \
+python simulator_online_train.py \
+  --train-replay-dir replay/train \
+  --valid-replay-dir replay/valid \
+  --warmstart-checkpoint checkpoints/offline_cql/best_checkpoint.pt \
+  --offline-transitions transitions/train \
+  --model-factory my_model_adapter:build_models \
+  --output-dir checkpoints/hybrid_v2 \
+  --cql-alpha-start 0.5 \
+  --cql-alpha-end 0.05 \
+  --historical-fraction-start 0.5 \
+  --historical-fraction-end 0.1 \
   --device cuda
 ```
 
-输出包括 `action_id`、对应 price offset/quantity fraction 和全部 masked Q-values。
+This progressively increases near-policy simulator experience while reducing, rather than abruptly removing, offline pessimism.
 
-## 第一轮建议调参
+## Output artifacts
 
-建议小范围搜索：
+`simulator_online_train.py` writes:
 
-- `cql_alpha`: `[0.1, 0.5, 1.0, 2.0, 5.0]`
-- `learning_rate`: `[1e-4, 3e-4]`
-- `batch_size`: `[1024, 2048, 4096]`
-- `target_update_interval`: `[500, 1000, 2500]`
-- reward penalty weights：先以 P&L 为主，逐个增加 penalty，不要一次全部调大。
+```text
+best_simulator_online_checkpoint.pt
+latest_simulator_online_checkpoint.pt
+training_log.jsonl
+training_summary.json
+run_config.json
+state_feature_names.json
+```
 
-监控：
+A saved checkpoint can be evaluated separately with:
 
-- validation TD loss；
-- CQL gap；
-- policy/behavior action agreement；
-- learned action distribution；
-- Q-value scale；
-- chronological historical replay P&L；
-- fill、inventory age、terminal inventory、quote aggressiveness；
-- action support：policy 是否集中选择历史上很少出现的动作。
+```bash
+python evaluate_hybrid_policy.py \
+  --checkpoint checkpoints/hybrid_v2/best_simulator_online_checkpoint.pt \
+  --replay-dir replay/test \
+  --model-factory my_model_adapter:build_models \
+  --output-json checkpoints/hybrid_v2/test_metrics.json \
+  --replay-csv checkpoints/hybrid_v2/test_replay.csv \
+  --device cuda
+```
 
-**不要用 validation loss 代替 policy-value backtest。** 最终模型选择需要 chronological replay、shadow simulation，最好再加 FQE 或其他离线 policy evaluation。
+The best checkpoint is selected using mean return in the held-out **partial-fill** simulator. This is still not evidence of real-market value. Policy promotion requires chronological backtesting, cold-CUSIP evaluation, simulator sensitivity analysis and shadow mode.
 
-## 需要按你的数据修改的地方
+## Important modeling cautions
 
-1. `ColumnConfig` 的列名；
-2. `feature_config.example.json` 中的 state columns；
-3. action price-offset grid 和 quantity grid；
-4. quantity lot rounding；
-5. reward penalty coefficients；
-6. action mask 中的业务价格上下限、inventory/lot/risk constraints；
-7. terminal liquidation reward。当前 transition template 把 episode 最后一行标记为 terminal，但没有替你构造强制 liquidation cash flow。
+1. **MSRB trade quantity is demand-event capacity, not your guaranteed fill.**
+2. **A trade must not enter policy state before it is observable.**
+3. **The new quote cannot be evaluated against the trade that caused the refresh.**
+4. **Do not fit side models and evaluate the RL policy on the same time period.**
+5. **Run optimistic, win-only and partial-fill variants.** A policy that works only under full-capacity fills is simulator-dependent.
+6. **Check cold-CUSIP generalization.** A neural Q-function enables generalization but does not prove it.
+7. **Add uncertainty controls.** Use support masks, model ensembles, calibration residuals or conservative reward adjustments when the policy enters weakly supported regions.
+8. **Control quote flickering.** Use update cost, smoothness penalties, minimum quote life and operational rate limits.
+9. **Keep a fallback policy and kill switch** before any restricted live test.
 
-## 参考论文
+## Primary method references
 
 - Kumar et al., *Conservative Q-Learning for Offline Reinforcement Learning*, NeurIPS 2020.
 - van Hasselt et al., *Deep Reinforcement Learning with Double Q-learning*, AAAI 2016.
 - Wang et al., *Dueling Network Architectures for Deep Reinforcement Learning*, ICML 2016.
+- Sutton, Precup and Singh, *Between MDPs and Semi-MDPs*, Artificial Intelligence 1999.

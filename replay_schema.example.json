@@ -1,0 +1,22 @@
+{
+  "static_feature_cols": [
+    "coupon",
+    "duration",
+    "rating_numeric",
+    "amount_outstanding_log"
+  ],
+  "snapshot_feature_cols": [
+    "cep_bid_ask_width",
+    "realized_volatility_30d",
+    "liquidity_score",
+    "risk_score",
+    "price_scale",
+    "forward_price_change_4h",
+    "forward_price_up_probability",
+    "forward_price_down_probability",
+    "forward_model_confidence"
+  ],
+  "include_action_grid_features": true,
+  "quantity_unit": "par_thousands_or_one_consistent_internal_unit",
+  "price_unit": "dollar_price_per_100_par"
+}

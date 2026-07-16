@@ -544,7 +544,11 @@ class CQLDuelingDoubleDQNTrainer:
             action_mask = action_mask.bool()
         return q_values.masked_fill(~action_mask, torch.finfo(q_values.dtype).min)
 
-    def _compute_loss(self, batch: Tuple[Tensor, ...]) -> Tuple[Tensor, Dict[str, float]]:
+    def _compute_loss(
+        self,
+        batch: Tuple[Tensor, ...],
+        cql_alpha: Optional[float] = None,
+    ) -> Tuple[Tensor, Dict[str, float]]:
         (
             states,
             actions,
@@ -576,7 +580,8 @@ class CQLDuelingDoubleDQNTrainer:
         conservative_value = temperature * torch.logsumexp(q_valid / temperature, dim=1)
         cql_gap_per_row = conservative_value - q_data
         cql_gap = cql_gap_per_row.mean()
-        cql_loss = self.config.cql_alpha * cql_gap
+        effective_cql_alpha = self.config.cql_alpha if cql_alpha is None else float(cql_alpha)
+        cql_loss = effective_cql_alpha * cql_gap
         total_loss = td_loss + cql_loss
 
         with torch.no_grad():
@@ -592,8 +597,38 @@ class CQLDuelingDoubleDQNTrainer:
             "data_q": float(q_data.mean().detach().cpu()),
             "max_valid_q": float(max_valid_q.detach().cpu()),
             "behavior_agreement": float(behavior_agreement.detach().cpu()),
+            "cql_alpha": float(effective_cql_alpha),
         }
         return total_loss, metrics
+
+    def update_batch(
+        self,
+        batch: Tuple[Tensor, ...],
+        cql_alpha: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Run one optimizer step on an offline or simulator replay batch."""
+        self.online.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss, metrics = self._compute_loss(batch, cql_alpha=cql_alpha)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite loss at global_step={self.global_step}: {metrics}"
+            )
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(
+            self.online.parameters(), self.config.gradient_clip_norm
+        )
+        self.optimizer.step()
+        self.global_step += 1
+        if self.global_step % self.config.target_update_interval == 0:
+            self.target.load_state_dict(self.online.state_dict())
+        metrics = dict(metrics)
+        metrics["gradient_norm"] = float(grad_norm.detach().cpu())
+        metrics["global_step"] = float(self.global_step)
+        return metrics
+
+    def copy_online_to_target(self) -> None:
+        self.target.load_state_dict(self.online.state_dict())
 
     def train_epoch(self, loader: DataLoader[Tuple[Tensor, ...]], epoch: int) -> EpochMetrics:
         self.online.train()
