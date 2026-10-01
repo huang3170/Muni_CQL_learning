@@ -1,4 +1,4 @@
-"""Reproducible SYNTHETIC data only. Never mix these rows with trading data."""
+"""Reproducible SYNTHETIC rows in the same schema as the supplied dataframe."""
 from __future__ import annotations
 
 import numpy as np
@@ -10,48 +10,55 @@ def make_synthetic_data(episodes: int = 2400, days: int = 50, seed: int = 17) ->
     dates = pd.bdate_range("2026-07-15", periods=days)
     rows = []
     for e in range(episodes):
-        date = dates[e % days]
-        start = date + pd.Timedelta(hours=9, minutes=30)
-        inv = float(rng.choice([25000, 50000, 100000, 250000, 500000]))
+        start = dates[e % days] + pd.Timedelta(hours=9, minutes=30)
+        quantity = float(rng.choice([25000, 50000, 100000, 250000, 500000]))
         delta = float(rng.choice([0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]))
-        l3 = int(rng.random() < 0.6)
-        config, age = 0, 0.0
+        l3_active = int(rng.random() < 0.6)
+        liquidity = float(rng.uniform(0, 1))
+        mid = float(rng.uniform(98, 104))
+        width = float(rng.uniform(0.05, 0.30))
         for cycle in range(8):
-            rate = 0.0018 * np.exp(-4 * delta + 0.15 * np.log(inv / 100000) + 0.45 * l3 - 0.18 * np.log1p(age / 30))
+            rate = 0.0025 * np.exp(-4 * delta + 0.15 * np.log(quantity / 100000)
+                                    + 0.45 * l3_active + 0.25 * liquidity)
             waiting = rng.exponential(1 / rate)
-            event = int(waiting <= 30)
+            event = waiting <= 30
             exposure = min(waiting, 30.0)
             end = start + pd.Timedelta(minutes=exposure)
-            filled = float(inv if rng.random() < 0.4 else inv * 0.4) if event else 0.0
-            identifier = f"SYN_E{e}_I{cycle}"
+            filled = float(quantity if rng.random() < 0.4 else quantity * 0.4) if event else np.nan
             rows.append({
-                "interval_id": identifier, "position_episode_id": f"SYN_E{e}",
-                "inventory_segment_id": f"SYN_E{e}_S0", "quote_config_id": f"SYN_E{e}_Q{config}",
-                "cusip": f"SYN{e:06d}", "start_time": start, "end_time": end,
-                "exposure_minutes": exposure, "end_reason": "FILL" if event else ("QUOTE_INACTIVE" if cycle == 7 else "TIME_SLICE_END"),
-                "event": event, "fill_event_id": identifier + "_F" if event else None,
-                "fill_time": end if event else None,
-                "fill_level": int(rng.choice([1, 2, 3] if l3 else [1, 2])) if event else None,
-                "fill_par": filled, "inventory_par_start": inv,
-                "l1_active": 1, "l2_active": 1, "l3_active": l3,
-                "l1_price": 100 + delta, "l2_price": 100 + delta + 0.075,
-                "l3_price": 100 + delta - 0.060 if l3 else None,
-                "cep_mid": 100.0, "cep_asof_time": start - pd.Timedelta(minutes=2),
-                "delta_l1": delta, "gap_l2": 0.075, "gap_l3": -0.060 if l3 else None,
-                "config_age_minutes": age, "l1_venue_set": "A", "l2_venue_set": "B|C",
-                "l3_venue_set": "R" if l3 else "", "train_eligible": 1, "quality_reason": "OK",
-                "duration_years": float(5 + e % 10), "rating_bucket": ["AA", "A", "BBB"][e % 3],
-                "sector": ["GO", "Revenue"][e % 2],
+                "cusip": f"SYN{e:06d}", "quantity": quantity,
+                "l1_price": mid + delta, "l2_price": mid + delta + 0.075,
+                "l3_price": mid + delta - 0.060,
+                "l1_active": 1, "l2_active": 1, "l3_active": l3_active,
+                "cycle_time": start, "exposure_minutes": exposure,
+                "episode_id": f"SYN_E{e}", "quote_end_time": end,
+                "first_fill_level": int(rng.choice([1, 2, 3] if l3_active else [1, 2])) if event else None,
+                "first_fill_quantity": filled,
+                "cep_time": start - pd.Timedelta(minutes=2),
+                "bid_price": mid - width / 2, "ask_price": mid + width / 2,
+                "mid_price": mid, "cep_age_min": 2.0,
+                "cep_bid_ask_width": width,
+                "l1_vs_mid": delta, "l2_vs_mid": delta + 0.075,
+                "l3_vs_mid": delta - 0.060,
+                "time_to_maturity": float(365 * (5 + e % 10)),
+                "rating": ["AA", "A", "BBB"][e % 3],
+                "liquidity": liquidity, "coupon": float(3 + e % 4),
             })
             if event:
-                inv -= filled
-                if inv < 1e-6:
+                quantity -= filled
+                if quantity < 1e-6:
                     break
-                config += 1
-                age = 0.0
-            else:
-                age += exposure
-            # Synthetic assumption: after an early fill the next valid quote
-            # starts at the next scheduled boundary; the intervening gap is idle.
+            # After an early fill, quoting resumes at the next scheduled cycle.
             start += pd.Timedelta(minutes=30)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Only ordinary input features receive missing values. Labels and interval
+    # timestamps stay complete so the example has known exposure/outcomes.
+    ordinary = ["quantity", "l1_price", "l2_price", "l3_price", "l1_active",
+                "l2_active", "l3_active", "bid_price", "ask_price", "mid_price",
+                "cep_age_min", "cep_bid_ask_width", "l1_vs_mid", "l2_vs_mid",
+                "l3_vs_mid", "time_to_maturity", "rating", "coupon"]
+    for column in ordinary + ["liquidity"]:
+        fraction = 0.24 if column == "liquidity" else 0.02
+        missing = rng.choice(df.index, size=round(fraction * len(df)), replace=False)
+        df.loc[missing, column] = np.nan
+    return df
