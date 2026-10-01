@@ -11,10 +11,12 @@ from scipy.optimize import minimize
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+from .schema import QuoteSchema, normalize_quote_states, normalize_quote_training
+
 
 END_REASONS = {
     "FILL", "TIME_SLICE_END", "QUOTE_CHANGE", "QUOTE_INACTIVE",
-    "INVENTORY_INCREASE", "RFQ_FILL", "INVENTORY_ADJUSTMENT",
+    "INVENTORY_INCREASE", "RFQ_FILL", "INVENTORY_ADJUSTMENT", "CENSORED",
     "MARKET_CLOSE", "DATA_CUTOFF", "DATA_GAP", "UNKNOWN",
 }
 
@@ -37,6 +39,18 @@ class TrainingConfig:
     min_censor_survival: float = 0.05
     bootstrap_repetitions: int = 300
     seed: int = 20261001
+    # Applies to user column names (cycle_time, quantity, time_to_maturity, ...).
+    # None requires timezone-aware source timestamps instead of guessing.
+    input_timezone: str | None = "America/New_York"
+    quantity_multiplier: float = 1.0
+    maturity_unit: str = "days"
+    liquidity_kind: str = "numeric"
+    quote_end_is_first_fill: bool = True
+
+    def quote_schema(self) -> QuoteSchema:
+        return QuoteSchema(self.input_timezone, self.quantity_multiplier,
+                           self.maturity_unit, self.liquidity_kind,
+                           self.quote_end_is_first_fill)
 
 
 def _numeric(df: pd.DataFrame, name: str) -> pd.Series:
@@ -50,18 +64,20 @@ def _utc(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce", format="mixed")
 
 
-def prepare_data(raw: pd.DataFrame, strict: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+def prepare_data(raw: pd.DataFrame, strict: bool = True,
+                 schema: QuoteSchema | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Validate, derive state fields, and return eligible rows plus exclusion audit.
 
     Does not rebuild intervals or infer market calendars. Exposure must already
     represent observable active quoting time. All input frames are copied.
     """
+    raw = normalize_quote_training(raw, schema or QuoteSchema())
     required = [
         "interval_id", "position_episode_id", "quote_config_id", "cusip",
         "start_time_utc", "end_time_utc", "exposure_minutes", "end_reason",
-        "event", "fill_event_id", "fill_time_utc", "inventory_par_start",
+        "event", "fill_event_id", "fill_time_utc",
         "l1_active", "l2_active", "l3_active", "l1_price", "l2_price",
-        "l3_price", "cep_mid", "cep_asof_time_utc", "config_age_minutes",
+        "l3_price", "cep_mid", "cep_asof_time_utc",
         "train_eligible",
     ]
     missing = sorted(set(required) - set(raw.columns))
@@ -87,7 +103,7 @@ def prepare_data(raw: pd.DataFrame, strict: bool = True) -> tuple[pd.DataFrame, 
     flag(df.interval_id.duplicated(keep=False), "DUPLICATE_INTERVAL_ID")
     for c in ["start_time_utc", "end_time_utc", "cep_asof_time_utc", "fill_time_utc"]:
         df[c] = _utc(df[c])
-    for c in ["event", "exposure_minutes", "inventory_par_start", "config_age_minutes",
+    for c in ["event", "exposure_minutes", "inventory_par_start", "quote_quantity", "config_age_minutes",
               "l1_active", "l2_active", "l3_active", "l1_price", "l2_price", "l3_price", "cep_mid"]:
         df[c] = _numeric(df, c)
     for c in ["start_time_utc", "end_time_utc", "cep_asof_time_utc"]:
@@ -109,8 +125,9 @@ def prepare_data(raw: pd.DataFrame, strict: bool = True) -> tuple[pd.DataFrame, 
     duplicate_index = df.loc[positive & requested].index[duplicate_event]
     flag(df.index.isin(duplicate_index), "DUPLICATE_FILL_EVENT_ID")
     flag(~positive & (df.fill_time_utc.notna() | ~missing_fill_id), "NONFILL_HAS_EVENT_LABEL")
-    flag(~np.isfinite(df.inventory_par_start) | df.inventory_par_start.le(0), "INVALID_INVENTORY")
-    flag(~np.isfinite(df.config_age_minutes) | df.config_age_minutes.lt(0), "INVALID_CONFIG_AGE")
+    for c in ["inventory_par_start", "quote_quantity"]:
+        flag(np.isinf(df[c]) | df[c].le(0), f"INVALID_{c.upper()}")
+    flag(np.isinf(df.config_age_minutes) | df.config_age_minutes.lt(0), "INVALID_CONFIG_AGE")
     for l in (1, 2, 3):
         active, price = df[f"l{l}_active"], df[f"l{l}_price"]
         flag(~active.isin([0, 1]), f"INVALID_L{l}_MASK")
@@ -165,10 +182,11 @@ def prepare_data(raw: pd.DataFrame, strict: bool = True) -> tuple[pd.DataFrame, 
 
 
 def chronological_split(df: pd.DataFrame, config: TrainingConfig) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, dict]:
-    """Date split with whole parent episodes/configurations crossing cuts purged.
+    """Local-date split, purging only individual intervals crossing a boundary.
 
-    No split is defined from event time or outcome. Long crossing episodes can be
-    disproportionately removed; audit counts must be reviewed before acceptance.
+    Parent episodes and configuration IDs may appear in multiple partitions.
+    This evaluates future quotes, including quotes for inventory already held.
+    A row ending exactly at a cut stays on the left; one starting there goes right.
     """
     if (config.validation_start is None) != (config.test_start is None):
         raise ValueError("Supply both validation_start and test_start, or neither.")
@@ -177,6 +195,10 @@ def chronological_split(df: pd.DataFrame, config: TrainingConfig) -> tuple[dict[
         def boundary(s: str) -> pd.Timestamp:
             stamp = pd.Timestamp(s)
             stamp = stamp.tz_localize(config.timezone) if stamp.tzinfo is None else stamp
+            stamp = stamp.tz_convert(config.timezone)
+            if pd.isna(stamp) or stamp != stamp.normalize():
+                raise ValueError(f"Split boundaries must be midnight in {config.timezone}; "
+                                 "supply local dates such as YYYY-MM-DD.")
             return stamp.tz_convert("UTC")
         cut1, cut2 = boundary(config.validation_start), boundary(config.test_start)
     else:
@@ -193,20 +215,16 @@ def chronological_split(df: pd.DataFrame, config: TrainingConfig) -> tuple[dict[
     frame = df.copy()
     split = np.where(frame.start_time_utc < cut1, "train", np.where(frame.start_time_utc < cut2, "validation", "test"))
     purge = pd.Series(False, index=frame.index)
-    for cols in [["cusip", "position_episode_id"], ["cusip", "quote_config_id"]]:
-        groups = frame.groupby(cols, dropna=False, sort=False)
-        lo = groups.start_time_utc.transform("min")
-        hi = groups.end_time_utc.transform("max")
-        for cut in [cut1, cut2]:
-            # Includes groups with starts exactly at the next partition boundary.
-            crossing = (lo < cut) & ((hi > cut) | groups.start_time_utc.transform("max").ge(cut))
-            purge |= crossing
+    for cut in [cut1, cut2]:
+        # Never inspect the end of the whole position: later inventory activity
+        # cannot make an already completed, historical quote row unavailable.
+        purge |= frame.start_time_utc.lt(cut) & frame.end_time_utc.gt(cut)
     frame["split"] = split
     frame.loc[purge, "split"] = "purged_boundary"
     parts = {name: frame.loc[frame.split.eq(name)].copy() for name in ["train", "validation", "test"]}
     for name, part in parts.items():
         if part.empty:
-            raise ValueError(f"{name} is empty after boundary purge. Set explicit dates and inspect episode lengths.")
+            raise ValueError(f"{name} is empty after boundary purge. Set explicit dates and inspect interval timestamps.")
     if parts["train"].event.sum() < 1 or parts["validation"].event.sum() < 1:
         raise ValueError("Training and validation each need observed fill events.")
     audit_rows = []
@@ -216,30 +234,45 @@ def chronological_split(df: pd.DataFrame, config: TrainingConfig) -> tuple[dict[
                            "episodes": part._episode_group.nunique(),
                            "start": part.start_time_utc.min().isoformat(),
                            "end": part.end_time_utc.max().isoformat()})
+    episode_partition_counts = frame.loc[~purge].groupby(
+        ["cusip", "position_episode_id"], dropna=False, sort=False).split.nunique()
     details = {"validation_start_utc": cut1.isoformat(), "test_start_utc": cut2.isoformat(),
+               "timezone": config.timezone,
+               "validation_start_local": cut1.tz_convert(config.timezone).isoformat(),
+               "test_start_local": cut2.tz_convert(config.timezone).isoformat(),
                "purged_row_fraction": float(purge.mean()),
                "purged_event_fraction": float(frame.loc[purge, "event"].sum() / max(frame.event.sum(), 1)),
-               "split_rule": "chronological; purge whole crossing parent episodes and configurations"}
+               "purged_exposure_fraction": float(frame.loc[purge, "exposure_minutes"].sum() / frame.exposure_minutes.sum()),
+               "eligible_episodes": int(frame._episode_group.nunique()),
+               "episodes_in_multiple_splits": int(episode_partition_counts.gt(1).sum()),
+               "split_rule": "chronological local-midnight boundaries; purge only individual crossing intervals; allow shared episodes/configurations"}
     return parts, pd.DataFrame(audit_rows), details
 
 
-def state_features(df: pd.DataFrame, timezone: str) -> pd.DataFrame:
+def state_features(df: pd.DataFrame, timezone: str = "America/New_York",
+                   schema: QuoteSchema | None = None) -> pd.DataFrame:
     """Explicit feature allowlist. Labels/end reasons/durations cannot enter X."""
+    df = normalize_quote_states(df, schema or QuoteSchema())
     start = _utc(df["start_time_utc"])
     local = start.dt.tz_convert(timezone)
     minute = local.dt.hour * 60 + local.dt.minute + local.dt.second / 60
     features = pd.DataFrame(index=df.index)
-    for src, dst in [("inventory_par_start", "log_inventory"), ("config_age_minutes", "log_config_age"),
+    for src, dst in [("inventory_par_start", "log_inventory"), ("quote_quantity", "log_quote_quantity"),
+                     ("config_age_minutes", "log_config_age"),
                      ("market_trade_count_1d", "log_market_trade_count_1d"), ("market_trade_par_1d", "log_market_trade_par_1d"),
                      ("last_market_trade_age_minutes", "log_last_trade_age"), ("since_last_buy_minutes", "log_since_last_buy")]:
         values = _numeric(df, src)
         if values.lt(0).any() or np.isinf(values).any():
             raise ValueError(f"{src} must be finite nonnegative values or missing.")
         features[dst] = np.log1p(values)
-    for c in ["gap_l2", "gap_l3", "duration_years", "market_spread", "cep_change_30m", "cep_volatility_1d"]:
+    for c in ["gap_l2", "gap_l3", "cep_mid", "time_to_maturity_years", "coupon",
+              "liquidity_score", "duration_years", "market_spread", "cep_change_30m", "cep_volatility_1d"]:
         features[c] = _numeric(df, c)
         if np.isinf(features[c]).any():
             raise ValueError(f"Infinite feature: {c}")
+    for c in ["time_to_maturity_years", "market_spread", "coupon"]:
+        if features[c].lt(0).any():
+            raise ValueError(f"{c} must be nonnegative or missing.")
     features["time_sin"] = np.sin(2 * np.pi * minute / 1440)
     features["time_cos"] = np.cos(2 * np.pi * minute / 1440)
     cep_age = (start - _utc(df["cep_asof_time_utc"])).dt.total_seconds() / 60
@@ -247,9 +280,9 @@ def state_features(df: pd.DataFrame, timezone: str) -> pd.DataFrame:
         raise ValueError("Future CEP at prediction time.")
     features["log_cep_age"] = np.log1p(cep_age)
     features["active_template"] = template_keys(df)
-    for c in ["rating_bucket", "sector", "l1_venue_set", "l2_venue_set", "l3_venue_set"]:
+    for c in ["rating_bucket", "liquidity_bucket", "sector", "l1_venue_set", "l2_venue_set", "l3_venue_set"]:
         if c in df:
-            values = df[c].fillna("__MISSING__").astype(str)
+            values = df[c].astype("string").str.strip().replace("", pd.NA).fillna("__MISSING__").astype(str)
             if c.endswith("venue_set"):
                 values = values.map(lambda s: "|".join(sorted(set(x.strip() for x in s.split("|") if x.strip()))))
             features[c] = values
@@ -266,18 +299,24 @@ def template_keys(df: pd.DataFrame) -> pd.Series:
 
 
 class DesignMatrix:
-    def __init__(self, with_price: bool, timezone: str, price_scale: float):
+    def __init__(self, with_price: bool, timezone: str, price_scale: float,
+                 schema: QuoteSchema | None = None):
         self.with_price, self.timezone, self.price_scale = with_price, timezone, price_scale
+        self.schema = schema or QuoteSchema()
         if price_scale <= 0:
             raise ValueError("price_scale must be positive.")
 
     def fit(self, df: pd.DataFrame) -> "DesignMatrix":
-        f = state_features(df, self.timezone)
+        f = state_features(df, self.timezone, self.schema)
         self.numeric = [c for c in f if pd.api.types.is_numeric_dtype(f[c]) and f[c].notna().any()]
         self.categorical = [c for c in f if not pd.api.types.is_numeric_dtype(f[c]) and f[c].nunique() > 1]
         self.imputer = SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)
         n = self.imputer.fit_transform(f[self.numeric])
-        self.scaler = StandardScaler().fit(n, sample_weight=df.exposure_minutes.to_numpy())
+        # Center before weighted variance accumulation to avoid tiny negative
+        # variances (and sqrt warnings) for constant coupon/mid-price columns.
+        origin = n[0].copy()
+        self.scaler = StandardScaler().fit(n - origin, sample_weight=df.exposure_minutes.to_numpy())
+        self.scaler.mean_ += origin
         names = list(self.imputer.get_feature_names_out(self.numeric))
         self.encoder = None
         if self.categorical:
@@ -291,7 +330,8 @@ class DesignMatrix:
         return self
 
     def transform(self, df: pd.DataFrame) -> sparse.csr_matrix:
-        f = state_features(df, self.timezone)
+        df = normalize_quote_states(df, self.schema)
+        f = state_features(df, self.timezone, self.schema)
         num = self.scaler.transform(self.imputer.transform(f[self.numeric]))
         arrays = [sparse.csr_matrix(np.ones((len(df), 1))), sparse.csr_matrix(num)]
         if self.encoder is not None:
@@ -351,11 +391,11 @@ class ExponentialFillModel:
     """
     def __init__(self, alpha: float = 0.001, with_price: bool = True,
                  timezone: str = "America/New_York", price_scale: float = 0.10,
-                 max_iter: int = 1500):
+                 max_iter: int = 1500, schema: QuoteSchema | None = None):
         if alpha < 0:
             raise ValueError("alpha cannot be negative.")
         self.alpha, self.with_price = alpha, with_price
-        self.design = DesignMatrix(with_price, timezone, price_scale)
+        self.design = DesignMatrix(with_price, timezone, price_scale, schema)
         self.max_iter = max_iter
 
     @staticmethod

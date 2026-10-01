@@ -7,11 +7,11 @@ import pandas as pd
 
 def make_synthetic_data(episodes: int = 2400, days: int = 50, seed: int = 17) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    dates = pd.bdate_range("2026-07-15", periods=days, tz="America/New_York")
+    dates = pd.bdate_range("2026-07-15", periods=days)
     rows = []
     for e in range(episodes):
         date = dates[e % days]
-        start = (date + pd.Timedelta(hours=9, minutes=30)).tz_convert("UTC")
+        start = date + pd.Timedelta(hours=9, minutes=30)
         inv = float(rng.choice([25000, 50000, 100000, 250000, 500000]))
         delta = float(rng.choice([0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]))
         l3 = int(rng.random() < 0.6)
@@ -27,16 +27,16 @@ def make_synthetic_data(episodes: int = 2400, days: int = 50, seed: int = 17) ->
             rows.append({
                 "interval_id": identifier, "position_episode_id": f"SYN_E{e}",
                 "inventory_segment_id": f"SYN_E{e}_S0", "quote_config_id": f"SYN_E{e}_Q{config}",
-                "cusip": f"SYN{e:06d}", "start_time_utc": start, "end_time_utc": end,
+                "cusip": f"SYN{e:06d}", "start_time": start, "end_time": end,
                 "exposure_minutes": exposure, "end_reason": "FILL" if event else ("QUOTE_INACTIVE" if cycle == 7 else "TIME_SLICE_END"),
                 "event": event, "fill_event_id": identifier + "_F" if event else None,
-                "fill_time_utc": end if event else None,
+                "fill_time": end if event else None,
                 "fill_level": int(rng.choice([1, 2, 3] if l3 else [1, 2])) if event else None,
                 "fill_par": filled, "inventory_par_start": inv,
                 "l1_active": 1, "l2_active": 1, "l3_active": l3,
                 "l1_price": 100 + delta, "l2_price": 100 + delta + 0.075,
                 "l3_price": 100 + delta - 0.060 if l3 else None,
-                "cep_mid": 100.0, "cep_asof_time_utc": start - pd.Timedelta(minutes=2),
+                "cep_mid": 100.0, "cep_asof_time": start - pd.Timedelta(minutes=2),
                 "delta_l1": delta, "gap_l2": 0.075, "gap_l3": -0.060 if l3 else None,
                 "config_age_minutes": age, "l1_venue_set": "A", "l2_venue_set": "B|C",
                 "l3_venue_set": "R" if l3 else "", "train_eligible": 1, "quality_reason": "OK",
